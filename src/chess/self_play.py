@@ -499,9 +499,9 @@ class ParallelSelfPlay:
 
         while workers_done < num_workers:
             try:
-                msg_type, worker_id, payload = game_result_queue.get(timeout=600)
+                msg_type, worker_id, payload = game_result_queue.get(timeout=3600)
             except queue.Empty:
-                logger.warning("Timeout waiting for worker results")
+                logger.warning("Timeout waiting for worker results (3600s)")
                 break
 
             if msg_type == "game":
