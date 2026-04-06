@@ -29,6 +29,7 @@ while [[ $# -gt 0 ]]; do
                 --games_per_iter 4
                 --train_steps_per_iter 10
                 --num_parallel_games 2
+                --num_workers 1
                 --num_iterations 3
                 --eval_every 0
                 --save_every 0

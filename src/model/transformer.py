@@ -9,7 +9,8 @@ Key differences from the language model:
 
 Preserved from luxia-base:
 - QK-norm for training stability
-- Block Attention Residuals (AttnRes) for adaptive compute depth
+- Block Attention Residuals (AttnRes) — learned selective routing that equalizes
+  gradient flow across depth and prevents late-layer collapse
 - SwiGLU FFN, GQA, RMSNorm
 - FA2 backend support
 - Weight initialization with residual scaling
@@ -57,8 +58,8 @@ class ChessModelConfig:
     z_loss_weight: float = 1e-5
     activation_checkpointing: bool = False
 
-    # Attention backend: "auto" (FA2 if available, else SDPA), "fa2", "sdpa"
-    attn_impl: str = "auto"
+    # Attention backend: "sdpa" (default, confirmed fastest), "fa2", "auto"
+    attn_impl: str = "sdpa"
 
     # Block Attention Residuals
     attn_res: bool = False
@@ -439,7 +440,53 @@ class ChessTransformer(nn.Module):
         )
         return self.norm(x)
 
-    # ── Forward pass ───────────────────────────────────────────────────
+    # ── Forward passes ──────────────────────────────────────────────────
+
+    def _embed(self, board_tokens: torch.Tensor) -> torch.Tensor:
+        """Embed board tokens into hidden representations. (B, 67) → (B, 67, D)."""
+        castling = self.castling_embed(board_tokens[:, 0])
+        ep = self.ep_embed(board_tokens[:, 1])
+        side = self.side_embed(board_tokens[:, 2])
+        pieces = self.piece_embed(board_tokens[:, 3:])
+
+        pos_ids = torch.arange(self.config.seq_len, device=board_tokens.device)
+        pos = self.pos_embed(pos_ids)
+
+        return torch.cat([
+            (castling + pos[0]).unsqueeze(1),
+            (ep + pos[1]).unsqueeze(1),
+            (side + pos[2]).unsqueeze(1),
+            pieces + pos[3:].unsqueeze(0),
+        ], dim=1)
+
+    def backbone_forward(self, board_tokens: torch.Tensor) -> torch.Tensor:
+        """Run embedding + transformer layers + norm, without heads.
+
+        Used by NCA bootstrap training (which attaches its own prediction head).
+
+        Args:
+            board_tokens: (B, 67) long tensor.
+
+        Returns:
+            hidden_states: (B, 67, D) normalized hidden representations.
+        """
+        x = self._embed(board_tokens)
+
+        if self.config.attn_res:
+            x = self._forward_attn_res(x)
+        else:
+            for layer in self.layers:
+                if self.config.activation_checkpointing and self.training:
+                    x = torch_checkpoint(
+                        layer, x,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                else:
+                    x = layer(x)
+            x = self.norm(x)
+
+        return x
 
     def forward(
         self,
@@ -455,51 +502,14 @@ class ChessTransformer(nn.Module):
             value: (B, 1) tanh-squashed value in [-1, 1].
         """
         B = board_tokens.shape[0]
+        x = self.backbone_forward(board_tokens)
 
-        # ── Embed input tokens ─────────────────────────────────────────
-        # Global tokens get dedicated embeddings + positional
-        castling = self.castling_embed(board_tokens[:, 0])  # (B, D)
-        ep = self.ep_embed(board_tokens[:, 1])              # (B, D)
-        side = self.side_embed(board_tokens[:, 2])           # (B, D)
-
-        # Square tokens: piece embedding
-        pieces = self.piece_embed(board_tokens[:, 3:])       # (B, 64, D)
-
-        # Positional embeddings for all 67 positions
-        pos_ids = torch.arange(self.config.seq_len, device=board_tokens.device)
-        pos = self.pos_embed(pos_ids)  # (67, D)
-
-        # Combine: global tokens + square tokens, each with positional encoding
-        x = torch.cat([
-            (castling + pos[0]).unsqueeze(1),
-            (ep + pos[1]).unsqueeze(1),
-            (side + pos[2]).unsqueeze(1),
-            pieces + pos[3:].unsqueeze(0),
-        ], dim=1)  # (B, 67, D)
-
-        # ── Transformer backbone ──────────────────────────────────────
-        if self.config.attn_res:
-            x = self._forward_attn_res(x)
-        else:
-            for layer in self.layers:
-                if self.config.activation_checkpointing and self.training:
-                    x = torch_checkpoint(
-                        layer, x,
-                        use_reentrant=False,
-                        preserve_rng_state=False,
-                    )
-                else:
-                    x = layer(x)
-            x = self.norm(x)
-
-        # ── Policy head ───────────────────────────────────────────────
-        # Only square tokens (positions 3:67) contribute to policy
+        # Policy head: square tokens only
         square_features = x[:, self.config.num_global_tokens :, :]  # (B, 64, D)
         policy_logits = self.policy_head(square_features)           # (B, 64, 73)
         policy_logits = policy_logits.reshape(B, -1)                # (B, 4672)
 
-        # ── Value head ────────────────────────────────────────────────
-        # Mean pool ALL tokens (global + squares)
+        # Value head: pool all tokens
         pooled = x.mean(dim=1)                                      # (B, D)
         value = torch.tanh(self.value_fc2(F.relu(self.value_fc1(pooled))))  # (B, 1)
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import time
 from pathlib import Path
 from typing import Optional
@@ -32,7 +33,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from src.model.transformer import ChessModelConfig, ChessTransformer, MODEL_CONFIGS
 from src.chess.board import NUM_PIECE_TYPES
-from src.chess.self_play import SelfPlayConfig, SelfPlayWorker
+from src.chess.self_play import SelfPlayConfig, SelfPlayWorker, ParallelSelfPlay
 from src.chess.evaluation import EvalConfig, StockfishEvaluator
 from src.training.replay_buffer import ReplayBuffer
 from src.training.muon import build_hybrid_optimizer, HybridScheduler
@@ -41,91 +42,243 @@ from src.monitoring.geometric import GeometricMonitor, MonitorConfig
 logger = logging.getLogger(__name__)
 
 
+# ── Graceful shutdown ──────────────────────────────────────────────────────
+
+_shutdown_requested = False
+
+
+def _request_shutdown(signum: int, frame: object) -> None:
+    """Signal handler for graceful exit. Second signal forces immediate exit."""
+    global _shutdown_requested
+    if _shutdown_requested:
+        logger.warning("Second signal received — forcing exit")
+        raise SystemExit(1)
+    _shutdown_requested = True
+    logger.info(
+        "Shutdown requested (signal %d) — will checkpoint after current step",
+        signum,
+    )
+
+
 # ── NCA Bootstrap ─────────────────────────────────────────────────────────
 
 
 def run_nca_bootstrap(
     model: ChessTransformer,
     device: torch.device,
+    checkpoint_dir: Path,
     num_rules: int = 2000,
     sims_per_rule: int = 8,
     max_pairs: int = 2_000_000,
-    training_steps: int = 10000,
+    min_steps: int = 2000,
+    max_steps: int = 20000,
     batch_size: int = 256,
-    lr: float = 3e-4,
+    muon_lr: float = 0.02,
+    adamw_lr: float = 3e-4,
+    ns_coefficients: str = "gram_ns",
+    seed: int = 17,
+    saturation_check_every: int = 200,
+    saturation_threshold: float = 0.3,
+    save_every: int = 1000,
+    dataset_path: Optional[str] = None,
+    skip_reinit: bool = False,
+    wandb_run: object = None,
 ) -> None:
-    """NCA pre-training phase: teach attention circuits grid dynamics.
+    """NCA pre-training: teach attention circuits 8x8 grid dynamics.
 
-    Generates 8x8 NCA trajectories, trains the model to predict next-frame
-    cell states, then reinitializes embeddings for chess.
+    Uses Muon + AdamW (same as chess training). Monitors geometric metrics
+    for saturation and stops when plateaued. Saves a checkpoint of the raw
+    NCA-trained weights BEFORE reinitializing embeddings.
+
+    The checkpoint allows:
+    - Resuming without re-running NCA
+    - Inspecting NCA-trained weights for analysis
+    - Extracting geometric profiles for AttnRes boundary selection
     """
+    import random as _random
     from src.nca.generator import ChessNCAConfig, generate_nca_dataset
 
     logger.info("=" * 60)
-    logger.info("NCA Bootstrap Phase")
+    logger.info("NCA Bootstrap Phase (seed=%d)", seed)
     logger.info("=" * 60)
 
-    # Generate NCA dataset
-    nca_config = ChessNCAConfig()
-    inputs, targets = generate_nca_dataset(
-        config=nca_config,
-        num_rules=num_rules,
-        sims_per_rule=sims_per_rule,
-        device=device,
-        max_pairs=max_pairs,
-    )
-    logger.info("NCA dataset: %d frame pairs", len(inputs))
+    # Check for existing NCA checkpoint (skip if found)
+    nca_ckpt_path = checkpoint_dir / "nca_checkpoint.pt"
+    nca_resume_path = checkpoint_dir / "nca_resume.pt"
 
-    # Temporary prediction head: predict next-frame cell states (13 classes per cell)
+    if nca_ckpt_path.exists():
+        logger.info("Found final NCA checkpoint at %s — skipping NCA phase", nca_ckpt_path)
+        ckpt = torch.load(nca_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"], strict=False)
+        logger.info("Loaded NCA weights (step %d, loss %.4f)", ckpt.get("step", -1), ckpt.get("loss", -1))
+        if not skip_reinit:
+            model.reinit_embeddings_for_chess()
+            logger.info("Embeddings reinitialized for chess.")
+        del ckpt
+        return
+
+    # Resume state (populated if intermediate checkpoint exists)
+    resume_data: Optional[dict] = None
+    start_step = 0
+
+    if nca_resume_path.exists():
+        logger.info("Resuming NCA from intermediate checkpoint: %s", nca_resume_path)
+        resume_data = torch.load(nca_resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(resume_data["model"], strict=False)
+        start_step = resume_data["step"] + 1
+        logger.info(
+            "Will resume from step %d (loss %.4f, best %.4f)",
+            start_step, resume_data.get("loss", -1), resume_data.get("best_loss", -1),
+        )
+
+    # Seed for reproducibility (deterministic dataset on fresh start or resume)
+    torch.manual_seed(seed)
+    _random.seed(seed)
+
+    # Load or generate NCA dataset
+    if dataset_path is not None:
+        logger.info("Loading NCA dataset from %s", dataset_path)
+        ds = torch.load(dataset_path, map_location="cpu", weights_only=False)
+        inputs = ds["inputs"].long()  # uint8 → int64 for embedding lookup
+        targets = ds["targets"].long()
+        if max_pairs is not None and len(inputs) > max_pairs:
+            inputs = inputs[:max_pairs]
+            targets = targets[:max_pairs]
+        del ds
+    else:
+        nca_config = ChessNCAConfig()
+        inputs, targets = generate_nca_dataset(
+            config=nca_config,
+            num_rules=num_rules,
+            sims_per_rule=sims_per_rule,
+            device=device,
+            max_pairs=max_pairs,
+        )
+    # Split: 90% train, 10% held-out eval (same seed — avoids cross-seed confound)
+    n_total = len(inputs)
+    perm = torch.randperm(n_total)
+    n_eval = max(1000, n_total // 10)
+    eval_idx, train_idx = perm[:n_eval], perm[n_eval:]
+    eval_inputs, eval_targets = inputs[eval_idx], targets[eval_idx]
+    inputs, targets = inputs[train_idx], targets[train_idx]
+    n = len(inputs)
+    logger.info(
+        "NCA dataset: %d train + %d eval pairs (%.1fM + %.1fM tokens)",
+        n, n_eval, n * 67 / 1e6, n_eval * 67 / 1e6,
+    )
+
+    # NCA prediction head: per-square → 13 cell states
     nca_head = torch.nn.Linear(model.config.hidden_size, NUM_PIECE_TYPES).to(device)
     torch.nn.init.normal_(nca_head.weight, std=0.02)
     torch.nn.init.zeros_(nca_head.bias)
 
-    # Simple AdamW for NCA phase (no Muon — this is short warmup)
-    all_params = list(model.parameters()) + list(nca_head.parameters())
-    optimizer = torch.optim.AdamW(all_params, lr=lr, weight_decay=0.01)
+    # Muon + AdamW (same hybrid strategy as chess training)
+    muon_opt, adamw_opt = build_hybrid_optimizer(
+        model,
+        muon_lr=muon_lr,
+        muon_momentum=0.95,
+        muon_weight_decay=0.01,
+        muon_ns_iterations=5,
+        muon_ns_coefficients=ns_coefficients,
+        adamw_lr=adamw_lr,
+        adamw_betas=(0.9, 0.95),
+        adamw_weight_decay=0.1,
+    )
+    # NCA head goes to AdamW (it's a temporary head, not a 2D weight matrix for Muon)
+    nca_head_opt = torch.optim.AdamW(nca_head.parameters(), lr=adamw_lr, weight_decay=0.01)
 
-    # Training loop
+    # Warmup schedule
+    warmup_steps = min(500, min_steps // 4)
+
+    # Geometric monitoring for saturation detection
+    monitor = GeometricMonitor(model, MonitorConfig(tier1_every=saturation_check_every))
+    # Use a fixed probe batch for longitudinal tracking
+    probe_idx = torch.randperm(n)[:64]
+    monitor.set_probe_batch(inputs[probe_idx])
+
+    # Saturation tracking: store metric history for slope ratio computation
+    metric_history: dict[str, list[float]] = {}
+
+    def _check_saturation(step: int) -> bool:
+        """Check if key metrics have plateaued (slope ratio < threshold).
+
+        Slope ratio = |change in last third of history| / |change in first third|.
+        When < threshold (0.3), the metric is changing <30% as fast as early training.
+        ALL required metrics must be saturated simultaneously.
+        """
+        if step < min_steps:
+            return False
+        # Core metrics: loss must plateau, plus at least 2 geometric metrics
+        required = ["loss", "geo/rankme_last"]
+        geometric = [
+            k for k in metric_history
+            if k.startswith("geo/layer_") and k.endswith("/anisotropy")
+        ]
+        # Add the first available anisotropy metric
+        if geometric:
+            required.append(geometric[0])
+
+        saturated_count = 0
+        for key in required:
+            if key not in metric_history or len(metric_history[key]) < 6:
+                return False
+            vals = metric_history[key]
+            third = len(vals) // 3
+            if third < 2:
+                return False
+            first_slope = abs(vals[third - 1] - vals[0])
+            last_slope = abs(vals[-1] - vals[-third])
+            first_slope = max(first_slope, 1e-8)
+            ratio = last_slope / first_slope
+            if ratio <= saturation_threshold:
+                saturated_count += 1
+            if wandb_run is not None:
+                wandb_run.log({f"nca/saturation_ratio/{key}": ratio}, step=step)
+
+        if saturated_count == len(required):
+            logger.info(
+                "NCA saturation detected at step %d (%d/%d metrics plateaued)",
+                step, saturated_count, len(required),
+            )
+            return True
+        return False
+
+    # ── Training loop ─────────────────────────────────────────────
     model.train()
-    n = len(inputs)
-    for step in range(training_steps):
-        # Random batch
+    autocast_enabled = device.type == "cuda"
+    best_loss = float("inf")
+
+    # Apply resume state (optimizer + head weights, metric history)
+    if resume_data is not None:
+        nca_head.load_state_dict(resume_data["nca_head"])
+        muon_opt.load_state_dict(resume_data["muon_opt"])
+        adamw_opt.load_state_dict(resume_data["adamw_opt"])
+        nca_head_opt.load_state_dict(resume_data["nca_head_opt"])
+        best_loss = resume_data.get("best_loss", float("inf"))
+        metric_history.update(resume_data.get("metric_history", {}))
+        logger.info("Loaded resume state (best_loss=%.4f, resuming at step %d)", best_loss, start_step)
+        del resume_data
+
+    for step in range(start_step, max_steps):
+        # LR warmup
+        if step < warmup_steps:
+            lr_mult = (step + 1) / warmup_steps
+            for g in muon_opt.param_groups:
+                g["lr"] = muon_lr * lr_mult
+            for g in adamw_opt.param_groups:
+                g["lr"] = adamw_lr * lr_mult
+            for g in nca_head_opt.param_groups:
+                g["lr"] = adamw_lr * lr_mult
+
         idx = torch.randint(0, n, (batch_size,))
         batch_inputs = inputs[idx].to(device)
-        batch_targets = targets[idx].to(device)  # (B, 64) long
+        batch_targets = targets[idx].to(device)
 
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
-            policy_logits, _ = model(batch_inputs)
-
-            # Use the backbone hidden states for NCA prediction.
-            # Re-run just the backbone to get hidden states (skip policy/value heads).
-            # More efficient: use the square features from the policy head's input.
-            # The policy head linear is (D, 73) — we need (D, 13) from nca_head.
-            # Hack: get the pre-policy-head features by running forward and
-            # extracting from the hook. Simpler: just run the model normally
-            # and use a separate head on the square outputs.
-
-            # Run backbone only
-            B = batch_inputs.shape[0]
-            castling = model.castling_embed(batch_inputs[:, 0])
-            ep = model.ep_embed(batch_inputs[:, 1])
-            side = model.side_embed(batch_inputs[:, 2])
-            pieces = model.piece_embed(batch_inputs[:, 3:])
-            pos_ids = torch.arange(model.config.seq_len, device=device)
-            pos = model.pos_embed(pos_ids)
-            x = torch.cat([
-                (castling + pos[0]).unsqueeze(1),
-                (ep + pos[1]).unsqueeze(1),
-                (side + pos[2]).unsqueeze(1),
-                pieces + pos[3:].unsqueeze(0),
-            ], dim=1)
-            for layer in model.layers:
-                x = layer(x)
-            x = model.norm(x)
-
-            # Predict next cell states from square features
-            square_features = x[:, model.config.num_global_tokens:, :]  # (B, 64, D)
-            nca_logits = nca_head(square_features)  # (B, 64, 13)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+            # Use backbone_forward (no policy/value heads)
+            x = model.backbone_forward(batch_inputs)
+            square_features = x[:, model.config.num_global_tokens:, :]
+            nca_logits = nca_head(square_features)
 
             loss = F.cross_entropy(
                 nca_logits.reshape(-1, NUM_PIECE_TYPES),
@@ -133,18 +286,146 @@ def run_nca_bootstrap(
             )
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(all_params, 1.0)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        all_params = list(model.parameters()) + list(nca_head.parameters())
+        grad_norm = torch.nn.utils.clip_grad_norm_(all_params, 1.0).item()
 
-        if step % 500 == 0:
-            logger.info("NCA step %d/%d: loss=%.4f", step, training_steps, loss.item())
+        # Per-component grad norms (before step clears grads)
+        model_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf")).item()
+        head_grad_norm = torch.nn.utils.clip_grad_norm_(nca_head.parameters(), float("inf")).item()
 
-    # Transition to chess: reinitialize embeddings, discard NCA head
-    logger.info("NCA bootstrap complete. Reinitializing embeddings for chess...")
-    model.reinit_embeddings_for_chess()
-    del nca_head, optimizer, inputs, targets
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        muon_opt.step()
+        adamw_opt.step()
+        nca_head_opt.step()
+        muon_opt.zero_grad(set_to_none=True)
+        adamw_opt.zero_grad(set_to_none=True)
+        nca_head_opt.zero_grad(set_to_none=True)
+
+        loss_val = loss.item()
+        best_loss = min(best_loss, loss_val)
+
+        # Logging + saturation check
+        if step % saturation_check_every == 0:
+            metric_history.setdefault("loss", []).append(loss_val)
+            metric_history.setdefault("grad_norm", []).append(grad_norm)
+            metric_history.setdefault("model_grad_norm", []).append(model_grad_norm)
+            metric_history.setdefault("head_grad_norm", []).append(head_grad_norm)
+
+            # Held-out eval (same-seed, avoids cross-seed confound)
+            model.eval()
+            with torch.no_grad():
+                eval_batch = eval_inputs[:min(2048, len(eval_inputs))].to(device)
+                eval_tgt = eval_targets[:min(2048, len(eval_targets))].to(device)
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+                    eval_x = model.backbone_forward(eval_batch)
+                    eval_sq = eval_x[:, model.config.num_global_tokens:, :]
+                    eval_logits = nca_head(eval_sq)
+                    eval_loss = F.cross_entropy(
+                        eval_logits.reshape(-1, NUM_PIECE_TYPES),
+                        eval_tgt.reshape(-1),
+                    ).item()
+            metric_history.setdefault("eval_loss", []).append(eval_loss)
+
+            # Tier 1 geometric metrics
+            geo_metrics = monitor.tier1(step, probe_batch=monitor._probe_batch)
+            model.train()
+
+            for k, v in geo_metrics.items():
+                metric_history.setdefault(k, []).append(v)
+
+            logger.info(
+                "NCA step %d/%d: loss=%.4f eval=%.4f (best=%.4f) RankMe=%.1f",
+                step, max_steps, loss_val, eval_loss, best_loss,
+                geo_metrics.get("geo/rankme_last", 0),
+            )
+
+            # Log to wandb
+            if wandb_run is not None:
+                log_dict = {
+                    "nca/loss": loss_val,
+                    "nca/eval_loss": eval_loss,
+                    "nca/best_loss": best_loss,
+                    "nca/muon_lr": muon_opt.param_groups[0]["lr"],
+                    "nca/adamw_lr": adamw_opt.param_groups[0]["lr"],
+                    "nca/epoch": step * batch_size / n,
+                    # Gradient health
+                    "nca/grad_norm": grad_norm,
+                    "nca/model_grad_norm": model_grad_norm,
+                    "nca/head_grad_norm": head_grad_norm,
+                }
+                # Weight norms per layer (Frobenius)
+                for li, layer in enumerate(model.layers):
+                    q_norm = layer.attn.q_proj.weight.float().norm().item()
+                    o_norm = layer.attn.o_proj.weight.float().norm().item()
+                    gate_norm = layer.ffn.gate_proj.weight.float().norm().item()
+                    log_dict[f"nca/weight_norm/layer_{li}/q_proj"] = q_norm
+                    log_dict[f"nca/weight_norm/layer_{li}/o_proj"] = o_norm
+                    log_dict[f"nca/weight_norm/layer_{li}/gate_proj"] = gate_norm
+                log_dict.update({f"nca/{k}": v for k, v in geo_metrics.items()})
+                wandb_run.log(log_dict, step=step)
+
+            # Check saturation after min_steps
+            if _check_saturation(step):
+                logger.info("Stopping NCA at step %d (saturation)", step)
+                break
+
+        # Intermediate save (periodic or on shutdown request)
+        _should_save = (
+            (save_every > 0 and step > 0 and step % save_every == 0)
+            or _shutdown_requested
+        )
+        if _should_save:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            ckpt_data = {
+                "model": model.state_dict(),
+                "nca_head": nca_head.state_dict(),
+                "muon_opt": muon_opt.state_dict(),
+                "adamw_opt": adamw_opt.state_dict(),
+                "nca_head_opt": nca_head_opt.state_dict(),
+                "step": step,
+                "loss": loss_val,
+                "best_loss": best_loss,
+                "metric_history": metric_history,
+                "seed": seed,
+            }
+            # Resume checkpoint (overwritten each time)
+            torch.save(ckpt_data, nca_resume_path)
+            # Named snapshot (kept for post-hoc analysis / boundary discovery)
+            snapshot_path = checkpoint_dir / f"nca_step_{step:06d}.pt"
+            torch.save(ckpt_data, snapshot_path)
+            logger.info("Saved NCA checkpoint: step %d (%s)", step, snapshot_path.name)
+            del ckpt_data
+
+            if _shutdown_requested:
+                logger.info("NCA interrupted at step %d — will resume on restart", step)
+                return
+
+    # ── Save NCA checkpoint BEFORE reinit ─────────────────────────
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "model": model.state_dict(),
+        "nca_head": nca_head.state_dict(),
+        "step": step,
+        "loss": loss_val,
+        "best_loss": best_loss,
+        "metric_history": metric_history,
+        "seed": seed,
+    }, nca_ckpt_path)
+    logger.info("Saved NCA checkpoint: %s (step %d, loss %.4f)", nca_ckpt_path, step, loss_val)
+
+    # Clean up intermediate checkpoint (no longer needed)
+    if nca_resume_path.exists():
+        nca_resume_path.unlink()
+
+    # ── Transition to chess ───────────────────────────────────────
+    if not skip_reinit:
+        model.reinit_embeddings_for_chess()
+        logger.info("Embeddings reinitialized for chess.")
+    else:
+        logger.info("skip_reinit=True — keeping raw NCA weights (for boundary analysis)")
+
+    del nca_head, muon_opt, adamw_opt, nca_head_opt, inputs, targets
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     logger.info("=" * 60)
 
 
@@ -230,14 +511,23 @@ def train(args: argparse.Namespace) -> None:
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         )
 
+    # Register signal handlers for graceful shutdown (checkpoint on SIGTERM)
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
+
     # ── Model ──────────────────────────────────────────────────────────
     model_kwargs = MODEL_CONFIGS.get(args.model_size, {})
     config = ChessModelConfig(**model_kwargs)
 
     if args.attn_res:
         config.attn_res = True
+    if args.attn_res_boundaries:
+        config.attn_res = True
+        config.attn_res_boundaries = [int(x) for x in args.attn_res_boundaries.split(",")]
     if args.no_qk_norm:
         config.qk_norm = False
+    if args.activation_checkpointing:
+        config.activation_checkpointing = True
 
     model = ChessTransformer(config)
 
@@ -252,7 +542,56 @@ def train(args: argparse.Namespace) -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # ── Optimizer ──────────────────────────────────────────────────────
+    # ── Checkpoint dir (needed by NCA bootstrap) ──────────────────────
+    ckpt_dir = Path(args.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Wandb (init early so NCA phase can log too) ────────────────────
+    wandb_run = None
+    if is_main_process() and args.wandb:
+        try:
+            import wandb
+            if args.wandb_api_key:
+                os.environ["WANDB_API_KEY"] = args.wandb_api_key
+            wandb_run = wandb.init(
+                entity=args.wandb_entity,
+                project=args.wandb_project,
+                name=args.wandb_name,
+                config=vars(args),
+            )
+        except Exception as e:
+            logger.warning("Wandb init failed: %s", e)
+
+    # ── NCA Bootstrap (Phase 0, before DDP/optimizer) ─────────────────
+    if args.nca_bootstrap:
+        if is_main_process():
+            logger.info("Running NCA bootstrap phase...")
+        run_nca_bootstrap(
+            model=model,
+            device=device,
+            checkpoint_dir=ckpt_dir,
+            num_rules=args.nca_num_rules,
+            sims_per_rule=args.nca_sims_per_rule,
+            max_pairs=args.nca_max_pairs,
+            min_steps=args.nca_min_steps,
+            max_steps=args.nca_max_steps,
+            batch_size=args.batch_size,
+            muon_lr=args.muon_lr,
+            adamw_lr=args.adamw_lr,
+            ns_coefficients=args.ns_coefficients,
+            seed=args.nca_seed,
+            saturation_threshold=0.0 if args.nca_no_auto_stop else 0.3,
+            save_every=args.nca_save_every,
+            dataset_path=args.nca_dataset,
+            skip_reinit=args.nca_skip_reinit,
+            wandb_run=wandb_run,
+        )
+        if _shutdown_requested:
+            logger.info("Shutdown during NCA bootstrap — exiting cleanly")
+            cleanup_distributed()
+            return
+
+    # ── Optimizer (built on post-NCA model) ───────────────────────────
     muon_opt, adamw_opt = build_hybrid_optimizer(
         model,
         muon_lr=args.muon_lr,
@@ -282,12 +621,21 @@ def train(args: argparse.Namespace) -> None:
     # ── Self-play config ───────────────────────────────────────────────
     self_play_config = SelfPlayConfig(
         num_parallel=args.num_parallel_games,
+        num_workers=args.num_workers,
         mcts_simulations=args.mcts_simulations,
         temperature_threshold=args.temperature_threshold,
+        num_virtual_leaves=args.num_virtual_leaves,
     )
-    self_play_worker = SelfPlayWorker(
-        model=raw_model, config=self_play_config, device=device,
-    )
+
+    # Use multiprocessing when >1 worker, fallback to single-process
+    if args.num_workers > 1:
+        self_play_engine: ParallelSelfPlay | SelfPlayWorker = ParallelSelfPlay(
+            model=raw_model, config=self_play_config, device=device,
+        )
+    else:
+        self_play_engine = SelfPlayWorker(
+            model=raw_model, config=self_play_config, device=device,
+        )
 
     # ── Replay buffer ─────────────────────────────────────────────────
     replay_buffer = ReplayBuffer(capacity=args.buffer_size)
@@ -306,47 +654,6 @@ def train(args: argparse.Namespace) -> None:
         except RuntimeError as e:
             logger.warning("Stockfish evaluation disabled: %s", e)
 
-    # ── Wandb ─────────────────────────────────────────────────────────
-    wandb_run = None
-    if is_main_process() and args.wandb:
-        try:
-            import wandb
-            wandb_run = wandb.init(
-                project=args.wandb_project,
-                name=args.wandb_name,
-                config=vars(args),
-            )
-        except Exception as e:
-            logger.warning("Wandb init failed: %s", e)
-
-    # ── NCA Bootstrap (Phase 0) ──────────────────────────────────────
-    if args.nca_bootstrap:
-        if is_main_process():
-            logger.info("Running NCA bootstrap phase...")
-        run_nca_bootstrap(
-            model=raw_model,
-            device=device,
-            num_rules=args.nca_num_rules,
-            sims_per_rule=args.nca_sims_per_rule,
-            max_pairs=args.nca_max_pairs,
-            training_steps=args.nca_training_steps,
-            batch_size=args.batch_size,
-        )
-        # Rebuild optimizers with fresh state after NCA
-        muon_opt, adamw_opt = build_hybrid_optimizer(
-            raw_model,
-            muon_lr=args.muon_lr, muon_momentum=0.95,
-            muon_weight_decay=args.muon_wd, muon_ns_iterations=5,
-            muon_ns_coefficients=args.ns_coefficients,
-            adamw_lr=args.adamw_lr, adamw_betas=(0.9, 0.95),
-            adamw_weight_decay=0.1,
-        )
-        scheduler = HybridScheduler(
-            muon_opt, adamw_opt,
-            warmup_steps=args.warmup_steps,
-            total_steps=999_999_999, decay_start_pct=1.0,
-        )
-
     # ── Geometric Monitoring ──────────────────────────────────────────
     monitor: Optional[GeometricMonitor] = None
     if is_main_process() and args.monitor:
@@ -356,8 +663,6 @@ def train(args: argparse.Namespace) -> None:
         ))
 
     # ── Checkpoint loading ────────────────────────────────────────────
-    ckpt_dir = Path(args.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
     start_iteration = 0
 
     latest_ckpt = ckpt_dir / "latest.pt"
@@ -382,7 +687,7 @@ def train(args: argparse.Namespace) -> None:
             logger.info("Iteration %d: generating %d games...", iteration, args.games_per_iter)
 
         raw_model.eval()
-        games = self_play_worker.generate_games(args.games_per_iter)
+        games = self_play_engine.generate_games(args.games_per_iter)
 
         total_positions = sum(len(g) for g in games)
         for game in games:
@@ -416,7 +721,7 @@ def train(args: argparse.Namespace) -> None:
             target_policies = target_policies.to(device)
             target_values = target_values.to(device)
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 policy_logits, value_pred = model(boards)
                 losses = compute_loss(
                     policy_logits, value_pred,
@@ -513,11 +818,11 @@ def train(args: argparse.Namespace) -> None:
                     wandb_run.log(eval_results, step=iteration)
 
         # ── Checkpoint ────────────────────────────────────────────
-        if (
-            is_main_process()
-            and args.save_every > 0
-            and (iteration + 1) % args.save_every == 0
-        ):
+        _should_ckpt = is_main_process() and (
+            (args.save_every > 0 and (iteration + 1) % args.save_every == 0)
+            or _shutdown_requested
+        )
+        if _should_ckpt:
             ckpt_path = ckpt_dir / f"iter_{iteration:06d}.pt"
             torch.save({
                 "model": raw_model.state_dict(),
@@ -531,6 +836,10 @@ def train(args: argparse.Namespace) -> None:
                 latest_ckpt.unlink()
             latest_ckpt.symlink_to(ckpt_path.name)
             logger.info("Saved checkpoint: %s", ckpt_path)
+
+        if _shutdown_requested:
+            logger.info("Graceful shutdown at iteration %d", iteration)
+            break
 
     # ── Cleanup ───────────────────────────────────────────────────────
     if evaluator is not None:
@@ -550,7 +859,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_size", type=str, default="medium",
                         choices=list(MODEL_CONFIGS.keys()))
     parser.add_argument("--attn_res", action="store_true", help="Enable Block Attention Residuals")
+    parser.add_argument("--attn_res_boundaries", type=str, default=None,
+                        help="Explicit AttnRes boundaries, comma-separated (e.g. '0,3,7,12')")
     parser.add_argument("--no_qk_norm", action="store_true", help="Disable QK-norm")
+    parser.add_argument("--activation_checkpointing", action="store_true",
+                        help="Trade compute for VRAM — recompute activations during backward")
 
     # Training
     parser.add_argument("--num_iterations", type=int, default=1000)
@@ -569,7 +882,11 @@ def parse_args() -> argparse.Namespace:
 
     # Self-play
     parser.add_argument("--num_parallel_games", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=48,
+                        help="CPU worker processes for MCTS (1 = single-process)")
     parser.add_argument("--mcts_simulations", type=int, default=800)
+    parser.add_argument("--num_virtual_leaves", type=int, default=4,
+                        help="Parallel leaves per game via virtual loss")
     parser.add_argument("--temperature_threshold", type=int, default=30)
 
     # Evaluation
@@ -588,10 +905,22 @@ def parse_args() -> argparse.Namespace:
     # NCA Bootstrap
     parser.add_argument("--nca_bootstrap", action="store_true",
                         help="Run NCA pre-training before self-play")
+    parser.add_argument("--nca_seed", type=int, default=17, help="Lucky number")
     parser.add_argument("--nca_num_rules", type=int, default=2000)
     parser.add_argument("--nca_sims_per_rule", type=int, default=8)
     parser.add_argument("--nca_max_pairs", type=int, default=2_000_000)
-    parser.add_argument("--nca_training_steps", type=int, default=10000)
+    parser.add_argument("--nca_min_steps", type=int, default=2000,
+                        help="Min steps before saturation check")
+    parser.add_argument("--nca_max_steps", type=int, default=20000,
+                        help="Hard cap on NCA training steps")
+    parser.add_argument("--nca_no_auto_stop", action="store_true",
+                        help="Disable saturation auto-stop (train to max_steps or manual SIGTERM)")
+    parser.add_argument("--nca_save_every", type=int, default=1000,
+                        help="Save NCA intermediate checkpoint every N steps (for resume)")
+    parser.add_argument("--nca_dataset", type=str, default=None,
+                        help="Path to pre-generated NCA dataset .pt file (skip inline generation)")
+    parser.add_argument("--nca_skip_reinit", action="store_true",
+                        help="Don't reinit embeddings after NCA (for boundary analysis phase)")
 
     # Monitoring
     parser.add_argument("--monitor", action="store_true",
@@ -601,8 +930,11 @@ def parse_args() -> argparse.Namespace:
 
     # Logging
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="chess-engine")
+    parser.add_argument("--wandb_entity", type=str, default="aethera")
+    parser.add_argument("--wandb_project", type=str, default="metis")
     parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument("--wandb_api_key", type=str, default=None,
+                        help="Explicit wandb API key")
 
     return parser.parse_args()
 

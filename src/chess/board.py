@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Optional
 
 import chess
+import numpy as np
 import torch
 
 # ── Piece encoding ─────────────────────────────────────────────────────────
@@ -170,6 +171,9 @@ def _build_index_to_move() -> list[Optional[chess.Move]]:
 
 # Precomputed at import time
 INDEX_TO_MOVE: list[Optional[chess.Move]] = _build_index_to_move()
+MOVE_TO_INDEX: dict[chess.Move, int] = {
+    move: idx for idx, move in enumerate(INDEX_TO_MOVE) if move is not None
+}
 
 
 # ── Public API ─────────────────────────────────────────────────────────────
@@ -179,13 +183,9 @@ class BoardEncoder:
     """Encodes chess.Board into tensor representation for the transformer."""
 
     @staticmethod
-    def encode_board(board: chess.Board) -> torch.Tensor:
-        """Encode a board position as a tensor of token indices.
-
-        Returns:
-            Tensor of shape (67,) dtype=long.
-        """
-        tokens = torch.zeros(SEQ_LEN, dtype=torch.long)
+    def _encode_into(board: chess.Board, tokens: np.ndarray) -> None:
+        """Encode a board into a preallocated token array."""
+        tokens.fill(0)
 
         # Global token 0: castling rights (4-bit packed)
         castling = 0
@@ -209,12 +209,34 @@ class BoardEncoder:
         for sq, piece in board.piece_map().items():
             tokens[3 + sq] = PIECE_TO_INDEX[piece]
 
+    @staticmethod
+    def encode_board_array(board: chess.Board) -> np.ndarray:
+        """Encode a board position as a NumPy array of token indices."""
+        tokens = np.zeros(SEQ_LEN, dtype=np.int64)
+        BoardEncoder._encode_into(board, tokens)
         return tokens
+
+    @staticmethod
+    def encode_board(board: chess.Board) -> torch.Tensor:
+        """Encode a board position as a tensor of token indices.
+
+        Returns:
+            Tensor of shape (67,) dtype=long.
+        """
+        return torch.from_numpy(BoardEncoder.encode_board_array(board))
+
+    @staticmethod
+    def encode_board_batch_array(boards: list[chess.Board]) -> np.ndarray:
+        """Encode multiple boards. Returns ndarray shape (B, 67)."""
+        batch = np.zeros((len(boards), SEQ_LEN), dtype=np.int64)
+        for i, board in enumerate(boards):
+            BoardEncoder._encode_into(board, batch[i])
+        return batch
 
     @staticmethod
     def encode_board_batch(boards: list[chess.Board]) -> torch.Tensor:
         """Encode multiple boards. Returns Tensor shape (B, 67)."""
-        return torch.stack([BoardEncoder.encode_board(b) for b in boards])
+        return torch.from_numpy(BoardEncoder.encode_board_batch_array(boards))
 
 
 class MoveEncoder:
@@ -223,10 +245,15 @@ class MoveEncoder:
     @staticmethod
     def move_to_index(move: chess.Move) -> int:
         """Convert a chess.Move to a policy index (0-4671)."""
-        move_type = _compute_move_type(
-            move.from_square, move.to_square, move.promotion,
-        )
-        return move.from_square * NUM_MOVE_TYPES + move_type
+        # Queen promotions share the same policy slot as the corresponding
+        # queen-type move landing on the last rank.
+        if move.promotion == chess.QUEEN:
+            move = chess.Move(move.from_square, move.to_square)
+
+        try:
+            return MOVE_TO_INDEX[move]
+        except KeyError as exc:
+            raise ValueError(f"Move is not encodable: {move}") from exc
 
     @staticmethod
     def index_to_move(index: int) -> Optional[chess.Move]:

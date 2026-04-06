@@ -16,7 +16,7 @@ import chess.engine
 import torch
 
 from src.chess.board import BoardEncoder, MoveEncoder
-from src.chess.mcts import MCTS, MCTSConfig
+from src.chess.mcts import MCTS, MCTSConfig, select_move
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +143,7 @@ class StockfishEvaluator:
                 visit_counts = mcts.search(board)
                 if not visit_counts:
                     break
-                move = mcts.select_move(visit_counts, temperature=0)
+                move = select_move(visit_counts, temperature=0)
             else:
                 # Stockfish's turn
                 result = engine.play(board, chess.engine.Limit(depth=sf_depth))

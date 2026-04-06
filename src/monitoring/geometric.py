@@ -221,6 +221,89 @@ class GeometricMonitor:
         )
         return metrics
 
+    # ── AttnRes boundary discovery ───────────────────────────────────
+
+    @torch.no_grad()
+    def extract_full_profile(
+        self,
+        probe_batch: Optional[torch.Tensor] = None,
+    ) -> dict[str, list[float]]:
+        """Extract per-layer geometric profile across ALL layers.
+
+        Used after NCA training to identify natural breakpoints for AttnRes
+        block boundary placement.
+
+        Returns:
+            Dict mapping metric name to list of per-layer values.
+            Keys: "anisotropy", "attn_entropy_mean", "stable_rank_q",
+                  "stable_rank_o", "stable_rank_gate", "stable_rank_down",
+                  "dead_units".
+        """
+        batch = probe_batch if probe_batch is not None else self._probe_batch
+        if batch is None:
+            logger.warning("No probe batch — cannot extract profile")
+            return {}
+
+        device = next(self.model.parameters()).device
+        batch = batch.to(device)
+        num_layers = len(self.model.layers)
+
+        # Get hidden states at ALL layers
+        was_training = self.model.training
+        self.model.eval()
+
+        all_hidden: dict[int, torch.Tensor] = {}
+        all_attn: dict[int, torch.Tensor] = {}
+
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+            x = self._embed_board(batch)
+            for i, layer in enumerate(self.model.layers):
+                x = layer(x)
+                all_hidden[i] = x.detach()
+                attn_w = self._get_attention_weights(layer, layer.attn_norm(x))
+                if attn_w is not None:
+                    all_attn[i] = attn_w
+
+        if was_training:
+            self.model.train()
+
+        # Compute per-layer metrics
+        profile: dict[str, list[float]] = {
+            "anisotropy": [],
+            "attn_entropy_mean": [],
+            "stable_rank_q": [],
+            "stable_rank_o": [],
+            "stable_rank_gate": [],
+            "stable_rank_down": [],
+            "dead_units": [],
+        }
+
+        for i in range(num_layers):
+            layer = self.model.layers[i]
+
+            if i in all_hidden:
+                h = all_hidden[i]
+                h_flat = h.reshape(-1, h.shape[-1])
+                profile["anisotropy"].append(_anisotropy(h_flat, max_samples=512))
+                profile["dead_units"].append(_dead_unit_fraction(h))
+            else:
+                profile["anisotropy"].append(0.0)
+                profile["dead_units"].append(0.0)
+
+            if i in all_attn:
+                ent_mean, _ = _attention_entropy_stats(all_attn[i])
+                profile["attn_entropy_mean"].append(ent_mean)
+            else:
+                profile["attn_entropy_mean"].append(0.0)
+
+            profile["stable_rank_q"].append(_stable_rank(layer.attn.q_proj.weight))
+            profile["stable_rank_o"].append(_stable_rank(layer.attn.o_proj.weight))
+            profile["stable_rank_gate"].append(_stable_rank(layer.ffn.gate_proj.weight))
+            profile["stable_rank_down"].append(_stable_rank(layer.ffn.down_proj.weight))
+
+        logger.info("Extracted full profile for %d layers", num_layers)
+        return profile
+
     # ── Forward pass for probing ───────────────────────────────────────
 
     def _probe_forward(
@@ -505,3 +588,91 @@ def _twonn_id(X: torch.Tensor) -> Optional[float]:
         return d
     except Exception:
         return None
+
+
+# ── AttnRes boundary suggestion ────────────────────────────────────────
+
+
+def suggest_attn_res_boundaries(
+    profile: dict[str, list[float]],
+    num_layers: int,
+    min_block_size: int = 2,
+    max_boundaries: int = 6,
+) -> list[int]:
+    """Suggest AttnRes block boundaries from a per-layer geometric profile.
+
+    Identifies layers where multiple metrics show large layer-to-layer jumps
+    simultaneously. Respects the empirical pattern: small blocks at start/end,
+    larger blocks in the middle.
+
+    Based on the luxia-base research methodology:
+    - Compute layer-to-layer deltas for each metric
+    - Normalize deltas to [0, 1] range per metric
+    - Sum normalized deltas across metrics → combined "jump score"
+    - Pick top-scoring layers as boundaries, respecting min_block_size
+
+    Args:
+        profile: Output of GeometricMonitor.extract_full_profile().
+        num_layers: Total number of transformer layers.
+        min_block_size: Minimum layers between boundaries.
+        max_boundaries: Maximum number of boundaries to suggest.
+
+    Returns:
+        Sorted list of boundary layer indices (always includes 0).
+    """
+    if not profile or num_layers < 4:
+        return [0]
+
+    # Compute layer-to-layer delta magnitude for each metric
+    metrics_to_use = ["anisotropy", "attn_entropy_mean", "stable_rank_q", "stable_rank_down"]
+    available = [m for m in metrics_to_use if m in profile and len(profile[m]) == num_layers]
+
+    if not available:
+        logger.warning("No usable metrics for boundary suggestion")
+        return [0]
+
+    # Combined jump score per layer boundary (between layer i and i+1)
+    jump_scores = [0.0] * (num_layers - 1)
+
+    for metric in available:
+        vals = profile[metric]
+        deltas = [abs(vals[i + 1] - vals[i]) for i in range(num_layers - 1)]
+        max_delta = max(deltas) if deltas else 1.0
+        if max_delta < 1e-10:
+            continue
+        # Normalize to [0, 1] and accumulate
+        for i, d in enumerate(deltas):
+            jump_scores[i] += d / max_delta
+
+    # Greedy boundary selection: pick highest-scoring positions
+    # respecting min_block_size between boundaries
+    boundaries = [0]  # Always include layer 0
+    candidates = sorted(range(len(jump_scores)), key=lambda i: jump_scores[i], reverse=True)
+
+    for candidate_layer in candidates:
+        boundary_layer = candidate_layer + 1  # Boundary is AT the layer after the jump
+        if boundary_layer >= num_layers:
+            continue
+
+        # Check min_block_size from all existing boundaries
+        too_close = any(abs(boundary_layer - b) < min_block_size for b in boundaries)
+        if too_close:
+            continue
+
+        boundaries.append(boundary_layer)
+        if len(boundaries) >= max_boundaries:
+            break
+
+    boundaries.sort()
+
+    # Log the block sizes
+    block_sizes = []
+    for i in range(len(boundaries)):
+        end = boundaries[i + 1] if i + 1 < len(boundaries) else num_layers
+        block_sizes.append(end - boundaries[i])
+    logger.info(
+        "Suggested AttnRes boundaries: %s (block sizes: %s)",
+        boundaries, block_sizes,
+    )
+
+    return boundaries

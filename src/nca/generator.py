@@ -250,6 +250,8 @@ def trajectory_to_training_pairs(
     Given a trajectory of T frames, produces T-1 training pairs where
     input is frame_t (67 tokens) and target is frame_{t+1}'s 64 cell states.
 
+    Fully vectorized — no Python loops over frames.
+
     Args:
         trajectory: (batch, T, n_groups, 8, 8) integer states.
 
@@ -258,17 +260,20 @@ def trajectory_to_training_pairs(
         targets: (N, 64) long tensor — next frame cell states (0-12).
     """
     B, T, G, H, W = trajectory.shape
-    inputs_list: list[torch.Tensor] = []
-    targets_list: list[torch.Tensor] = []
+    N = B * (T - 1)
 
-    for b in range(B):
-        for t in range(T - 1):
-            frame_input = encode_frame(trajectory[b, t])
-            frame_target = trajectory[b, t + 1].reshape(-1)  # (G*H*W,) → (64,)
-            inputs_list.append(frame_input)
-            targets_list.append(frame_target)
+    # Flatten cell states: input frames and target frames
+    cells_in = trajectory[:, :-1].reshape(N, G * H * W)    # (N, 64)
+    cells_out = trajectory[:, 1:].reshape(N, G * H * W)    # (N, 64)
 
-    return torch.stack(inputs_list), torch.stack(targets_list)
+    # Build input tokens: [castling, en_passant, side, ...64 cells]
+    inputs = torch.zeros(N, SEQ_LEN, dtype=torch.long)
+    inputs[:, 0] = torch.randint(0, 16, (N,))   # random castling noise
+    inputs[:, 1] = torch.randint(0, 9, (N,))    # random en passant noise
+    inputs[:, 2] = torch.randint(0, 2, (N,))    # random side noise
+    inputs[:, 3:] = cells_in
+
+    return inputs, cells_out
 
 
 # ── Complexity filtering ──────────────────────────────────────────────────
@@ -344,6 +349,65 @@ def generate_and_filter_rules(
     return accepted
 
 
+# ── Parallel worker ──────────────────────────────────────────────────────
+
+
+def _worker_generate_chunk(
+    worker_id: int,
+    num_rules: int,
+    sims_per_rule: int,
+    config: ChessNCAConfig,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Worker: generate rules → filter → simulate → encode. Returns (inputs, targets, candidates_tested).
+
+    Runs entirely on CPU. Each worker gets a unique seed for rule diversity.
+    """
+    # Single thread per worker — avoids N_workers × N_threads oversubscription
+    torch.set_num_threads(1)
+    random.seed(seed + worker_id)
+    torch.manual_seed(seed + worker_id)
+    device = torch.device("cpu")
+
+    # Generate + filter rules for this chunk
+    accepted: list[tuple[NCARule, dict]] = []
+    candidates_tested = 0
+    while len(accepted) < num_rules:
+        params = sample_rule_config(config)
+        rule = NCARule(
+            d_state=config.d_state,
+            n_groups=config.n_groups,
+            kernel_size=params["kernel_size"],
+            hidden_dim=params["hidden_dim"],
+            num_hidden_layers=params["num_hidden_layers"],
+        )
+        candidates_tested += 1
+        if not config.filter_enabled:
+            accepted.append((rule, params))
+            continue
+        ratio = evaluate_rule_complexity(rule, config, params, device)
+        if config.gzip_lower <= ratio <= config.gzip_upper:
+            accepted.append((rule, params))
+
+    # Simulate + encode
+    all_inputs: list[torch.Tensor] = []
+    all_targets: list[torch.Tensor] = []
+    for rule, params in accepted:
+        traj = simulate_trajectory(
+            rule=rule, config=config,
+            identity_bias=params["identity_bias"],
+            temperature=params["temperature"],
+            batch_size=sims_per_rule, device=device,
+        )
+        inp, tgt = trajectory_to_training_pairs(traj)
+        all_inputs.append(inp)
+        all_targets.append(tgt)
+
+    inputs = torch.cat(all_inputs, dim=0)
+    targets = torch.cat(all_targets, dim=0)
+    return inputs, targets, candidates_tested
+
+
 # ── Dataset generation ────────────────────────────────────────────────────
 
 
@@ -353,6 +417,8 @@ def generate_nca_dataset(
     sims_per_rule: int = 8,
     device: torch.device = torch.device("cpu"),
     max_pairs: Optional[int] = None,
+    num_workers: int = 1,
+    seed: int = 42,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate NCA training dataset as (input, target) frame pairs.
 
@@ -360,8 +426,10 @@ def generate_nca_dataset(
         config: NCA configuration.
         num_rules: Number of unique NCA rules to generate.
         sims_per_rule: Trajectories per rule.
-        device: GPU for simulation.
+        device: Device for simulation (ignored when num_workers > 1, uses CPU).
         max_pairs: Cap on total training pairs (None = unlimited).
+        num_workers: CPU workers for parallel generation.
+        seed: Base seed (each worker gets seed + worker_id).
 
     Returns:
         inputs: (N, 67) long tensor — encoded input frames.
@@ -372,7 +440,7 @@ def generate_nca_dataset(
     logger.info("=" * 60)
     logger.info("Grid: %dx%d, %d states, %d channels", 8, 8, config.d_state, config.n_groups)
     logger.info("Steps: %d (burn-in: %d)", config.num_steps, config.burn_in)
-    logger.info("Rules: %d, sims/rule: %d", num_rules, sims_per_rule)
+    logger.info("Rules: %d, sims/rule: %d, workers: %d", num_rules, sims_per_rule, num_workers)
 
     pairs_per_rule = sims_per_rule * (config.num_steps - 1)
     estimated_total = num_rules * pairs_per_rule
@@ -380,40 +448,74 @@ def generate_nca_dataset(
         estimated_total = min(estimated_total, max_pairs)
     logger.info("Estimated pairs: %d (%.1fM tokens)", estimated_total, estimated_total * 67 / 1e6)
 
-    # Generate rules
-    rules = generate_and_filter_rules(config, num_rules, device)
-
-    # Generate trajectories and create training pairs
-    all_inputs: list[torch.Tensor] = []
-    all_targets: list[torch.Tensor] = []
-    total_pairs = 0
     t0 = time.time()
 
-    for i, (rule, params) in enumerate(rules):
-        traj = simulate_trajectory(
-            rule=rule, config=config,
-            identity_bias=params["identity_bias"],
-            temperature=params["temperature"],
-            batch_size=sims_per_rule, device=device,
+    if num_workers > 1:
+        import torch.multiprocessing as mp
+        try:
+            mp.set_start_method("spawn", force=False)
+        except RuntimeError:
+            pass  # Already set
+
+        # Distribute rules across workers
+        base = num_rules // num_workers
+        remainder = num_rules % num_workers
+        rules_per_worker = [base + (1 if i < remainder else 0) for i in range(num_workers)]
+
+        logger.info("Spawning %d workers (%d-%d rules each)...",
+                     num_workers, min(rules_per_worker), max(rules_per_worker))
+
+        with mp.Pool(num_workers) as pool:
+            results = pool.starmap(_worker_generate_chunk, [
+                (i, rules_per_worker[i], sims_per_rule, config, seed)
+                for i in range(num_workers)
+            ])
+
+        all_inputs = [r[0] for r in results]
+        all_targets = [r[1] for r in results]
+        total_candidates = sum(r[2] for r in results)
+
+        inputs = torch.cat(all_inputs, dim=0)
+        targets = torch.cat(all_targets, dim=0)
+        del all_inputs, all_targets, results
+
+        elapsed = time.time() - t0
+        logger.info(
+            "Parallel gen: %d pairs from %d rules (%d candidates), %.1fs",
+            len(inputs), num_rules, total_candidates, elapsed,
         )
+    else:
+        # Single-process fallback
+        rules = generate_and_filter_rules(config, num_rules, device)
 
-        inputs, targets = trajectory_to_training_pairs(traj.cpu())
-        all_inputs.append(inputs)
-        all_targets.append(targets)
-        total_pairs += len(inputs)
+        all_inputs: list[torch.Tensor] = []
+        all_targets: list[torch.Tensor] = []
+        total_pairs = 0
 
-        if (i + 1) % 100 == 0:
-            elapsed = time.time() - t0
-            logger.info(
-                "  %d/%d rules, %d pairs, %.0f pairs/s",
-                i + 1, len(rules), total_pairs, total_pairs / max(elapsed, 1e-6),
+        for i, (rule, params) in enumerate(rules):
+            traj = simulate_trajectory(
+                rule=rule, config=config,
+                identity_bias=params["identity_bias"],
+                temperature=params["temperature"],
+                batch_size=sims_per_rule, device=device,
             )
+            inp, tgt = trajectory_to_training_pairs(traj.cpu())
+            all_inputs.append(inp)
+            all_targets.append(tgt)
+            total_pairs += len(inp)
 
-        if max_pairs is not None and total_pairs >= max_pairs:
-            break
+            if (i + 1) % 100 == 0:
+                elapsed = time.time() - t0
+                logger.info(
+                    "  %d/%d rules, %d pairs, %.0f pairs/s",
+                    i + 1, len(rules), total_pairs, total_pairs / max(elapsed, 1e-6),
+                )
 
-    inputs = torch.cat(all_inputs, dim=0)
-    targets = torch.cat(all_targets, dim=0)
+            if max_pairs is not None and total_pairs >= max_pairs:
+                break
+
+        inputs = torch.cat(all_inputs, dim=0)
+        targets = torch.cat(all_targets, dim=0)
 
     if max_pairs is not None and len(inputs) > max_pairs:
         inputs = inputs[:max_pairs]
@@ -422,9 +524,8 @@ def generate_nca_dataset(
     elapsed = time.time() - t0
     logger.info("=" * 60)
     logger.info(
-        "Done: %d pairs from %d rules, %.1fs (%.0f pairs/s)",
-        len(inputs), min(len(rules), i + 1 if 'i' in dir() else len(rules)),
-        elapsed, len(inputs) / max(elapsed, 1e-6),
+        "Done: %d pairs (%.1fM tokens), %.1fs (%.0f pairs/s)",
+        len(inputs), len(inputs) * 67 / 1e6, elapsed, len(inputs) / max(elapsed, 1e-6),
     )
 
     return inputs, targets
@@ -453,6 +554,8 @@ def main() -> None:
     p.add_argument("--no_mixed", action="store_true")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--num_workers", type=int, default=1,
+                   help="CPU workers for parallel generation")
     args = p.parse_args()
 
     random.seed(args.seed)
@@ -473,11 +576,21 @@ def main() -> None:
         sims_per_rule=args.sims_per_rule,
         device=torch.device(args.device),
         max_pairs=args.max_pairs,
+        num_workers=args.num_workers,
+        seed=args.seed,
     )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"inputs": inputs, "targets": targets}, output_path)
+
+    # Store as uint8 — values are 0-12 (NCA states) / 0-15 (castling), saves ~8x disk
+    torch.save({
+        "inputs": inputs.to(torch.uint8),
+        "targets": targets.to(torch.uint8),
+        "num_pairs": len(inputs),
+        "tokens_per_pair": SEQ_LEN,
+        "seed": args.seed,
+    }, output_path)
     logger.info("Saved to %s (%.1f MB)", output_path, output_path.stat().st_size / 1e6)
 
 

@@ -10,3 +10,9 @@ wandb/
 *.pt
 *.bin
 .venv/
+
+# Internal / deployment
+HANDOFF.md
+scripts/setup_*.sh
+*_snapshot.py
+extract_boundaries.py
