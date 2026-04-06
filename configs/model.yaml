@@ -1,0 +1,42 @@
+# Chess transformer model configurations
+# Usage: --model_size <name> selects preset; individual fields can be overridden via CLI
+
+smoke:
+  hidden_size: 128
+  num_layers: 4
+  num_attention_heads: 4
+  num_kv_heads: 2
+  head_dim: 32
+  intermediate_size: 384
+  value_hidden_size: 64
+  # ~800K params — for unit tests and smoke testing
+
+small:
+  hidden_size: 256
+  num_layers: 8
+  num_attention_heads: 4
+  num_kv_heads: 2
+  head_dim: 64
+  intermediate_size: 768
+  value_hidden_size: 128
+  # ~6.5M params — fast iteration, overnight training
+
+medium:
+  hidden_size: 512
+  num_layers: 12
+  num_attention_heads: 8
+  num_kv_heads: 4
+  head_dim: 64
+  intermediate_size: 1408
+  value_hidden_size: 256
+  # ~36M params — main target, comparable to AlphaZero (~24M)
+
+large:
+  hidden_size: 512
+  num_layers: 16
+  num_attention_heads: 8
+  num_kv_heads: 4
+  head_dim: 64
+  intermediate_size: 1408
+  value_hidden_size: 256
+  # ~47M params — for scaling experiments
