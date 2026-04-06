@@ -100,12 +100,14 @@ def _worker_fn(
     eval_result_queue: mp.Queue,
     game_result_queue: mp.Queue,
 ) -> None:
-    """Worker process: manages MCTS trees for assigned games.
+    """Worker process: manages MCTS trees for assigned games (CPU only).
 
     Communicates with the evaluator via queues for NN inference.
     Sends completed GameRecords to game_result_queue.
     """
     try:
+        # Prevent forked workers from inheriting parent's CUDA context
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
         _run_worker(
             worker_id, num_games, mcts_config, temperature,
             temperature_threshold, max_moves,
@@ -441,18 +443,15 @@ class ParallelSelfPlay:
         Returns:
             List of completed GameRecords.
         """
-        # Use spawn context to avoid inheriting CUDA context into workers
-        ctx = mp.get_context("spawn")
-
         num_workers = min(self.config.num_workers, num_games)
         games_per_worker = _distribute_games(num_games, num_workers)
 
-        # Communication queues (spawn-safe)
-        eval_request_queue = ctx.Queue()
+        # Communication queues
+        eval_request_queue: mp.Queue = mp.Queue()
         result_queues: dict[int, mp.Queue] = {
-            i: ctx.Queue() for i in range(num_workers)
+            i: mp.Queue() for i in range(num_workers)
         }
-        game_result_queue = ctx.Queue()
+        game_result_queue: mp.Queue = mp.Queue()
 
         # Start evaluator thread
         evaluator = _EvaluatorThread(
@@ -469,7 +468,7 @@ class ParallelSelfPlay:
         workers: list[mp.Process] = []
 
         for i in range(num_workers):
-            p = ctx.Process(
+            p = mp.Process(
                 target=_worker_fn,
                 args=(
                     i, games_per_worker[i], mcts_config,
