@@ -441,15 +441,18 @@ class ParallelSelfPlay:
         Returns:
             List of completed GameRecords.
         """
+        # Use spawn context to avoid inheriting CUDA context into workers
+        ctx = mp.get_context("spawn")
+
         num_workers = min(self.config.num_workers, num_games)
         games_per_worker = _distribute_games(num_games, num_workers)
 
-        # Communication queues
-        eval_request_queue: mp.Queue = mp.Queue()
+        # Communication queues (spawn-safe)
+        eval_request_queue = ctx.Queue()
         result_queues: dict[int, mp.Queue] = {
-            i: mp.Queue() for i in range(num_workers)
+            i: ctx.Queue() for i in range(num_workers)
         }
-        game_result_queue: mp.Queue = mp.Queue()
+        game_result_queue = ctx.Queue()
 
         # Start evaluator thread
         evaluator = _EvaluatorThread(
@@ -466,7 +469,7 @@ class ParallelSelfPlay:
         workers: list[mp.Process] = []
 
         for i in range(num_workers):
-            p = mp.Process(
+            p = ctx.Process(
                 target=_worker_fn,
                 args=(
                     i, games_per_worker[i], mcts_config,
