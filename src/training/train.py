@@ -686,17 +686,32 @@ def train(args: argparse.Namespace) -> None:
         if is_main_process():
             logger.info("Iteration %d: generating %d games...", iteration, args.games_per_iter)
 
+        selfplay_start = time.time()
         raw_model.eval()
         games = self_play_engine.generate_games(args.games_per_iter)
+        selfplay_time = time.time() - selfplay_start
 
         total_positions = sum(len(g) for g in games)
+        game_lengths = [len(g) for g in games]
+        avg_game_len = sum(game_lengths) / max(len(game_lengths), 1)
+        outcomes = {"white": 0, "black": 0, "draw": 0}
+        for g in games:
+            if g.outcome > 0.5:
+                outcomes["white"] += 1
+            elif g.outcome < -0.5:
+                outcomes["black"] += 1
+            else:
+                outcomes["draw"] += 1
+
         for game in games:
             replay_buffer.add_game(game)
 
         if is_main_process():
             logger.info(
-                "Generated %d games, %d positions (buffer: %d)",
-                len(games), total_positions, len(replay_buffer),
+                "Generated %d games, %d positions (avg %.0f moves, W/B/D=%d/%d/%d) in %.1fs (buffer: %d)",
+                len(games), total_positions, avg_game_len,
+                outcomes["white"], outcomes["black"], outcomes["draw"],
+                selfplay_time, len(replay_buffer),
             )
 
         # Set probe batch for monitoring (once, from first generation)
@@ -714,6 +729,8 @@ def train(args: argparse.Namespace) -> None:
         train_metrics: dict[str, float] = {
             "loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "z_loss": 0.0,
         }
+        grad_norm_sum = 0.0
+        train_start = time.time()
 
         for step in range(args.train_steps_per_iter):
             boards, target_policies, target_values = replay_buffer.sample(args.batch_size)
@@ -747,11 +764,14 @@ def train(args: argparse.Namespace) -> None:
             # Accumulate metrics
             for k in train_metrics:
                 train_metrics[k] += losses[k].item()
+            grad_norm_sum += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
 
         # Average metrics
         num_steps = args.train_steps_per_iter
         for k in train_metrics:
             train_metrics[k] /= num_steps
+        avg_grad_norm = grad_norm_sum / num_steps
+        train_time = time.time() - train_start
 
         iter_time = time.time() - iter_start
 
@@ -776,12 +796,27 @@ def train(args: argparse.Namespace) -> None:
                 log_dict = {
                     f"train/{k}": v for k, v in train_metrics.items()
                 }
-                log_dict["train/grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
-                log_dict["train/muon_lr"] = lrs["muon_lr"]
-                log_dict["train/adamw_lr"] = lrs["adamw_lr"]
-                log_dict["train/buffer_size"] = len(replay_buffer)
-                log_dict["train/positions_generated"] = total_positions
-                log_dict["train/iter_time"] = iter_time
+                log_dict.update({
+                    "train/grad_norm": avg_grad_norm,
+                    "train/muon_lr": lrs["muon_lr"],
+                    "train/adamw_lr": lrs["adamw_lr"],
+                    "train/buffer_size": len(replay_buffer),
+                    # Timing
+                    "time/iter_total": iter_time,
+                    "time/selfplay": selfplay_time,
+                    "time/training": train_time,
+                    "time/selfplay_pct": selfplay_time / max(iter_time, 1e-6) * 100,
+                    # Game stats
+                    "selfplay/positions": total_positions,
+                    "selfplay/games": len(games),
+                    "selfplay/avg_game_length": avg_game_len,
+                    "selfplay/white_wins": outcomes["white"],
+                    "selfplay/black_wins": outcomes["black"],
+                    "selfplay/draws": outcomes["draw"],
+                    "selfplay/positions_per_sec": total_positions / max(selfplay_time, 1e-6),
+                    # Training throughput
+                    "train/steps_per_sec": num_steps / max(train_time, 1e-6),
+                })
                 wandb_run.log(log_dict, step=iteration)
 
         # ── Geometric monitoring ──────────────────────────────────
