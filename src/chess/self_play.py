@@ -64,7 +64,7 @@ class SelfPlayConfig:
     num_virtual_leaves: int = 4
     temperature: float = 1.0
     temperature_threshold: int = 30
-    max_moves: int = 512
+    max_moves: int = 200
 
     def to_mcts_config(self) -> MCTSConfig:
         return MCTSConfig(
@@ -392,7 +392,7 @@ class _EvaluatorThread(threading.Thread):
     @torch.no_grad()
     def _evaluate_batch(
         self, encoded_boards: list[np.ndarray],
-        max_sub_batch: int = 32,
+        max_sub_batch: int = 128,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Run model inference on a batch of encoded board positions.
 

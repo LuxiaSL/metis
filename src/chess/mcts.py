@@ -34,7 +34,7 @@ class MCTSConfig:
     cpuct: float = 1.25
     dirichlet_alpha: float = 0.3   # Chess = 0.3 (AlphaZero)
     dirichlet_epsilon: float = 0.25
-    num_virtual_leaves: int = 4    # Parallel leaves per game via virtual loss
+    num_virtual_leaves: int = 8    # Parallel leaves per game via virtual loss
 
 
 class MCTSNode:
