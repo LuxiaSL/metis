@@ -38,10 +38,10 @@ else
         --activation_checkpointing \
         --nca_bootstrap \
         --batch_size 32 \
-        --num_workers 64 \
-        --num_parallel_games 64 \
-        --mcts_simulations 800 \
-        --games_per_iter 256 \
+        --num_workers 96 \
+        --num_parallel_games 96 \
+        --mcts_simulations ${MCTS_SIMS:-200} \
+        --games_per_iter 128 \
         --train_steps_per_iter 1000 \
         --num_iterations 200 \
         --eval_every 10 \

@@ -301,6 +301,7 @@ class _EvaluatorThread(threading.Thread):
         self._stop_event = threading.Event()
         self._total_evals = 0
         self._total_batches = 0
+        self._start_time = time.monotonic()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -377,6 +378,16 @@ class _EvaluatorThread(threading.Thread):
 
             self._total_evals += len(all_boards)
             self._total_batches += 1
+
+            # Periodic progress log (keeps Heimdall happy, shows throughput)
+            if self._total_batches % 500 == 0:
+                elapsed = time.monotonic() - self._start_time
+                logger.info(
+                    "Evaluator: %d evals, %d batches (avg %.1f/batch, %.0f evals/s)",
+                    self._total_evals, self._total_batches,
+                    self._total_evals / max(self._total_batches, 1),
+                    self._total_evals / max(elapsed, 1e-6),
+                )
 
     @torch.no_grad()
     def _evaluate_batch(
@@ -494,6 +505,11 @@ class ParallelSelfPlay:
                 break
 
             if msg_type == "game":
+                if len(completed_games) % 10 == 0 and len(completed_games) > 0:
+                    logger.info(
+                        "Self-play progress: %d/%d games complete",
+                        len(completed_games), num_games,
+                    )
                 # Reconstruct GameRecord from numpy-serialized data
                 record = GameRecord(
                     positions=[torch.from_numpy(p) for p in payload["positions"]],
