@@ -379,21 +379,35 @@ class _EvaluatorThread(threading.Thread):
     @torch.no_grad()
     def _evaluate_batch(
         self, encoded_boards: list[np.ndarray],
+        max_sub_batch: int = 64,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Run model inference on a batch of encoded board positions."""
-        batch = torch.from_numpy(np.stack(encoded_boards)).long().to(self.device)
+        """Run model inference on a batch of encoded board positions.
 
+        Splits large batches into sub-batches to avoid OOM with AttnRes
+        buffer stacking on shared GPUs.
+        """
         self.model.eval()
         autocast_enabled = self.device.type == "cuda"
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-            policy_logits, values = self.model(batch)
 
-        # Apply softmax over the full policy. MCTSNode.expand() renormalizes
-        # priors over legal moves only, which is equivalent to masked softmax.
-        policies = torch.softmax(policy_logits.float(), dim=-1).cpu().numpy()
-        vals = values.squeeze(-1).float().cpu().numpy()
+        if len(encoded_boards) <= max_sub_batch:
+            batch = torch.from_numpy(np.stack(encoded_boards)).long().to(self.device)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+                policy_logits, values = self.model(batch)
+            policies = torch.softmax(policy_logits.float(), dim=-1).cpu().numpy()
+            vals = values.squeeze(-1).float().cpu().numpy()
+            return policies, vals
 
-        return policies, vals
+        # Split into sub-batches for memory safety
+        all_policies = []
+        all_values = []
+        for start in range(0, len(encoded_boards), max_sub_batch):
+            sub = encoded_boards[start:start + max_sub_batch]
+            batch = torch.from_numpy(np.stack(sub)).long().to(self.device)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+                policy_logits, values = self.model(batch)
+            all_policies.append(torch.softmax(policy_logits.float(), dim=-1).cpu().numpy())
+            all_values.append(values.squeeze(-1).float().cpu().numpy())
+        return np.concatenate(all_policies), np.concatenate(all_values)
 
 
 # ── Parallel self-play (production) ────────────────────────────────────────
