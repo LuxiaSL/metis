@@ -379,7 +379,7 @@ class _EvaluatorThread(threading.Thread):
     @torch.no_grad()
     def _evaluate_batch(
         self, encoded_boards: list[np.ndarray],
-        max_sub_batch: int = 64,
+        max_sub_batch: int = 32,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Run model inference on a batch of encoded board positions.
 
