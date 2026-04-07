@@ -6,11 +6,15 @@ Two modes:
 
 Architecture (ParallelSelfPlay):
   Main process (GPU owner):
-    - EvaluatorThread: collects leaf positions from workers, batches GPU inference
+    - Collector thread: drains eval request queue into staging batches
+    - Inference thread: runs GPU inference, writes results to shared memory
   Worker processes (CPU, ×N):
     - Each manages a few games + MCTS trees
-    - Sends leaf positions for evaluation via queue
-    - Receives policies/values, expands + backprops locally
+    - Writes encoded boards to shared memory, sends slot indices via queue
+    - Reads policies/values from shared memory after inference completes
+
+Communication uses shared memory tensors (/dev/shm) for board/policy/value
+data, with only lightweight slot indices (~24 bytes) going through queues.
 """
 
 from __future__ import annotations
@@ -18,7 +22,6 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
-import pickle
 import queue
 import threading
 import time
@@ -28,6 +31,7 @@ from typing import Optional
 import chess
 import numpy as np
 import torch
+import torch.multiprocessing as tmp
 
 from src.chess.board import BoardEncoder, MoveEncoder, SEQ_LEN, POLICY_SIZE
 from src.chess.mcts import (
@@ -78,12 +82,12 @@ class SelfPlayConfig:
 
 # ── Eval request/response protocol ────────────────────────────────────────
 
-# Workers send: (worker_id, list[encoded_board_tensor])
-# If list is empty, worker has no leaves to evaluate (all terminal).
-# Evaluator sends back: (policies_ndarray, values_ndarray)
+# Workers send: (worker_id, slot_offset, count) — 3 ints, ~24 bytes pickled
+# Evaluator confirms: True (results written to shared memory at worker's slots)
 # Special sentinel: worker_id = -1 means "shutdown"
 
 _SHUTDOWN_SENTINEL = -1
+SLOTS_PER_WORKER = 64  # static allocation: worker i owns [i*64 : (i+1)*64]
 
 
 # ── Worker process ─────────────────────────────────────────────────────────
@@ -99,10 +103,13 @@ def _worker_fn(
     eval_request_queue: mp.Queue,
     eval_result_queue: mp.Queue,
     game_result_queue: mp.Queue,
+    shared_boards: torch.Tensor,
+    shared_policies: torch.Tensor,
+    shared_values: torch.Tensor,
 ) -> None:
     """Worker process: manages MCTS trees for assigned games (CPU only).
 
-    Communicates with the evaluator via queues for NN inference.
+    Communicates with the evaluator via shared memory + lightweight queue messages.
     Sends completed GameRecords to game_result_queue.
     """
     try:
@@ -112,6 +119,7 @@ def _worker_fn(
             worker_id, num_games, mcts_config, temperature,
             temperature_threshold, max_moves,
             eval_request_queue, eval_result_queue, game_result_queue,
+            shared_boards, shared_policies, shared_values,
         )
     except Exception as e:
         logger.error("Worker %d crashed: %s", worker_id, e, exc_info=True)
@@ -129,8 +137,17 @@ def _run_worker(
     eval_request_queue: mp.Queue,
     eval_result_queue: mp.Queue,
     game_result_queue: mp.Queue,
+    shared_boards: torch.Tensor,
+    shared_policies: torch.Tensor,
+    shared_values: torch.Tensor,
 ) -> None:
-    """Core worker loop."""
+    """Core worker loop using shared memory for board/policy/value transfer."""
+    # Numpy views of shared tensors (zero-copy, backed by /dev/shm)
+    slot_base = worker_id * SLOTS_PER_WORKER
+    boards_np = shared_boards.numpy()
+    policies_np = shared_policies.numpy()
+    values_np = shared_values.numpy()
+
     boards = [chess.Board() for _ in range(num_games)]
     trees: list[MCTSTree] = [MCTSTree() for _ in range(num_games)]
     records = [GameRecord() for _ in range(num_games)]
@@ -140,14 +157,24 @@ def _run_worker(
     nvl = mcts_config.num_virtual_leaves
 
     def _request_eval(boards_to_encode: list[chess.Board]) -> tuple[np.ndarray, np.ndarray]:
-        """Encode boards, send to evaluator, block for result."""
-        if not boards_to_encode:
+        """Encode boards into shared memory, request eval, read results back."""
+        count = len(boards_to_encode)
+        if count == 0:
             return np.empty((0, POLICY_SIZE), dtype=np.float32), np.empty(0, dtype=np.float32)
 
-        # Send as numpy to avoid torch tensor pickling issues
-        encoded = [BoardEncoder.encode_board_array(b) for b in boards_to_encode]
-        eval_request_queue.put((worker_id, encoded))
-        return eval_result_queue.get()
+        # Write encoded boards into our slot range in shared memory
+        for i, b in enumerate(boards_to_encode):
+            BoardEncoder._encode_into(b, boards_np[slot_base + i])
+
+        # Send lightweight slot index message (3 ints, ~24 bytes pickled)
+        eval_request_queue.put((worker_id, slot_base, count))
+
+        # Block until evaluator confirms results are written to our slots
+        eval_result_queue.get()
+
+        # Read results directly from shared memory (no copy needed —
+        # our slots won't be overwritten until we send the next request)
+        return policies_np[slot_base:slot_base + count], values_np[slot_base:slot_base + count]
 
     def _expand_roots() -> None:
         """Expand root nodes for all active games via NN evaluation."""
@@ -279,11 +306,19 @@ def _get_outcome(board: chess.Board) -> float:
     return 0.0
 
 
-# ── Evaluator (runs in main process thread) ────────────────────────────────
+# ── Double-buffered evaluator (runs in main process) ─────────────────────
 
 
-class _EvaluatorThread(threading.Thread):
-    """Collects eval requests from workers, batches GPU inference, sends results."""
+class _DoubleBufferedEvaluator:
+    """Two-thread evaluator: collector + inference for pipelined GPU batching.
+
+    Collector thread drains the request queue while inference processes the
+    previous batch on GPU. GPU inference releases the GIL, so the collector
+    runs concurrently during CUDA kernels.
+
+    All board/policy/value data flows through shared memory tensors —
+    only lightweight slot indices (3 ints per request) go through queues.
+    """
 
     def __init__(
         self,
@@ -292,22 +327,53 @@ class _EvaluatorThread(threading.Thread):
         eval_request_queue: mp.Queue,
         result_queues: dict[int, mp.Queue],
         num_workers: int,
+        shared_boards: torch.Tensor,
+        shared_policies: torch.Tensor,
+        shared_values: torch.Tensor,
         max_batch_wait_ms: float = 5.0,
     ) -> None:
-        super().__init__(daemon=True)
         self.model = model
         self.device = device
         self.eval_request_queue = eval_request_queue
         self.result_queues = result_queues
         self.num_workers = num_workers
         self.max_batch_wait = max_batch_wait_ms / 1000.0
+
+        # Shared memory (numpy views for fast read/write in dispatch)
+        self.shared_boards = shared_boards
+        self._policies_np = shared_policies.numpy()
+        self._values_np = shared_values.numpy()
+
+        # Double-buffer synchronization
         self._stop_event = threading.Event()
+        self._batch: list[tuple[int, int, int]] = []  # handed from collector
+        self._batch_ready = threading.Event()
+        self._inference_idle = threading.Event()
+        self._inference_idle.set()  # inference starts idle
+
+        # Stats (written by inference thread only, read from main after join)
         self._total_evals = 0
         self._total_batches = 0
         self._start_time = time.monotonic()
 
+        self._collector = threading.Thread(
+            target=self._collector_loop, name="eval-collector", daemon=True,
+        )
+        self._inference = threading.Thread(
+            target=self._inference_loop, name="eval-inference", daemon=True,
+        )
+
+    def start(self) -> None:
+        self._collector.start()
+        self._inference.start()
+
     def stop(self) -> None:
         self._stop_event.set()
+        self._batch_ready.set()  # wake inference thread if blocked
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        self._collector.join(timeout=timeout)
+        self._inference.join(timeout=timeout)
 
     @property
     def stats(self) -> dict[str, float]:
@@ -319,70 +385,104 @@ class _EvaluatorThread(threading.Thread):
             ),
         }
 
-    def run(self) -> None:
-        """Main evaluator loop."""
+    # ── Collector thread ─────────────────────────────────────────────
+
+    def _collector_loop(self) -> None:
+        """Drain request queue, accumulate batches, hand off to inference."""
+        staging: list[tuple[int, int, int]] = []
+
         while not self._stop_event.is_set():
-            # Collect requests from workers
-            batch: list[tuple[int, list[torch.Tensor]]] = []
+            # Block for first request
             try:
-                # Block for first request
                 req = self.eval_request_queue.get(timeout=0.5)
                 if req[0] == _SHUTDOWN_SENTINEL:
+                    self._stop_event.set()
+                    self._batch_ready.set()
                     break
-                batch.append(req)
-
-                # Greedily collect more (non-blocking)
-                deadline = time.monotonic() + self.max_batch_wait
-                while len(batch) < self.num_workers and time.monotonic() < deadline:
-                    try:
-                        req = self.eval_request_queue.get(timeout=0.001)
-                        if req[0] == _SHUTDOWN_SENTINEL:
-                            self._stop_event.set()
-                            break
-                        batch.append(req)
-                    except queue.Empty:
-                        break
-
+                staging.append(req)
             except queue.Empty:
                 continue
 
-            if not batch:
+            # Greedily collect more (non-blocking) until batch threshold or timeout
+            deadline = time.monotonic() + self.max_batch_wait
+            while len(staging) < self.num_workers and time.monotonic() < deadline:
+                try:
+                    req = self.eval_request_queue.get(timeout=0.001)
+                    if req[0] == _SHUTDOWN_SENTINEL:
+                        self._stop_event.set()
+                        self._batch_ready.set()
+                        break
+                    staging.append(req)
+                except queue.Empty:
+                    break
+
+            if not staging:
                 continue
 
-            # Flatten all boards from all workers (numpy → tensor)
-            all_boards: list[np.ndarray] = []
-            worker_sizes: list[tuple[int, int]] = []  # (worker_id, count)
-            for worker_id, boards in batch:
-                worker_sizes.append((worker_id, len(boards)))
-                all_boards.extend(boards)
+            # Wait for inference thread to finish previous batch
+            self._inference_idle.wait()
+            if self._stop_event.is_set():
+                # Drain: send confirmations so workers don't hang
+                for worker_id, _, _ in staging:
+                    try:
+                        self.result_queues[worker_id].put(True)
+                    except Exception:
+                        pass
+                break
 
-            # Evaluate
-            if all_boards:
-                policies, values = self._evaluate_batch(all_boards)
-            else:
-                policies = np.empty((0, POLICY_SIZE), dtype=np.float32)
-                values = np.empty(0, dtype=np.float32)
+            # Hand off batch to inference thread (swap)
+            self._batch = staging
+            staging = []
+            self._inference_idle.clear()
+            self._batch_ready.set()
 
-            # Distribute results
-            offset = 0
-            for worker_id, count in worker_sizes:
-                if count > 0:
-                    self.result_queues[worker_id].put((
-                        policies[offset:offset + count],
-                        values[offset:offset + count],
-                    ))
-                    offset += count
-                else:
-                    # Empty request → empty response
-                    self.result_queues[worker_id].put((
-                        np.empty((0, POLICY_SIZE), dtype=np.float32),
-                        np.empty(0, dtype=np.float32),
-                    ))
+    # ── Inference thread ─────────────────────────────────────────────
 
-            self._total_evals += len(all_boards)
+    def _inference_loop(self) -> None:
+        """Process batches on GPU, write results to shared memory."""
+        while not self._stop_event.is_set():
+            self._batch_ready.wait()
+            self._batch_ready.clear()
+
+            if self._stop_event.is_set():
+                break
+
+            batch = self._batch
+            self._batch = []
+
+            if not batch:
+                self._inference_idle.set()
+                continue
+
+            total_positions = sum(count for _, _, count in batch)
+
+            if total_positions > 0:
+                # Gather boards from shared memory into a contiguous tensor
+                slices: list[torch.Tensor] = []
+                for _, slot_offset, count in batch:
+                    if count > 0:
+                        slices.append(self.shared_boards[slot_offset:slot_offset + count])
+                board_tensor = torch.cat(slices, dim=0)
+
+                # GPU inference (releases GIL — collector runs concurrently)
+                policies, values = self._evaluate_batch(board_tensor)
+
+                # Write results back to shared memory at each worker's slots
+                idx = 0
+                for _, slot_offset, count in batch:
+                    if count > 0:
+                        self._policies_np[slot_offset:slot_offset + count] = policies[idx:idx + count]
+                        self._values_np[slot_offset:slot_offset + count] = values[idx:idx + count]
+                        idx += count
+
+            # Notify all workers in this batch (GIL-bound, keep minimal)
+            for worker_id, _, _ in batch:
+                self.result_queues[worker_id].put(True)
+
+            self._total_evals += total_positions
             self._total_batches += 1
 
-            # Periodic progress log (keeps Heimdall happy, shows throughput)
+            # Periodic progress log
             if self._total_batches % 500 == 0:
                 elapsed = time.monotonic() - self._start_time
                 logger.info(
@@ -392,37 +492,45 @@ class _EvaluatorThread(threading.Thread):
                     self._total_evals / max(elapsed, 1e-6),
                 )
 
+            self._inference_idle.set()
+
     @torch.no_grad()
     def _evaluate_batch(
-        self, encoded_boards: list[np.ndarray],
+        self,
+        board_tensor: torch.Tensor,
         max_sub_batch: int = 128,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Run model inference on a batch of encoded board positions.
+        """Run model inference on a contiguous batch of encoded boards.
 
-        Splits large batches into sub-batches to avoid OOM with AttnRes
-        buffer stacking on shared GPUs.
+        Splits large batches into sub-batches to avoid OOM on shared GPUs.
+
+        Args:
+            board_tensor: (N, 67) long tensor on CPU from shared memory.
+
+        Returns:
+            (policies, values) as numpy arrays.
         """
         self.model.eval()
         autocast_enabled = self.device.type == "cuda"
+        n = board_tensor.shape[0]
 
-        if len(encoded_boards) <= max_sub_batch:
-            batch = torch.from_numpy(np.stack(encoded_boards)).long().to(self.device)
+        if n <= max_sub_batch:
+            batch = board_tensor.to(self.device)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-                policy_logits, values = self.model(batch)
+                policy_logits, vals = self.model(batch)
             policies = torch.softmax(policy_logits.float(), dim=-1).cpu().numpy()
-            vals = values.squeeze(-1).float().cpu().numpy()
-            return policies, vals
+            values = vals.squeeze(-1).float().cpu().numpy()
+            return policies, values
 
-        # Split into sub-batches for memory safety
-        all_policies = []
-        all_values = []
-        for start in range(0, len(encoded_boards), max_sub_batch):
-            sub = encoded_boards[start:start + max_sub_batch]
-            batch = torch.from_numpy(np.stack(sub)).long().to(self.device)
+        # Sub-batch for VRAM safety
+        all_policies: list[np.ndarray] = []
+        all_values: list[np.ndarray] = []
+        for start in range(0, n, max_sub_batch):
+            sub = board_tensor[start:start + max_sub_batch].to(self.device)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-                policy_logits, values = self.model(batch)
+                policy_logits, vals = self.model(sub)
             all_policies.append(torch.softmax(policy_logits.float(), dim=-1).cpu().numpy())
-            all_values.append(values.squeeze(-1).float().cpu().numpy())
+            all_values.append(vals.squeeze(-1).float().cpu().numpy())
         return np.concatenate(all_policies), np.concatenate(all_values)
 
 
@@ -434,8 +542,8 @@ class ParallelSelfPlay:
 
     Architecture:
     - N worker processes do MCTS tree traversal on CPU
-    - 1 evaluator thread in the main process handles GPU inference
-    - Communication via multiprocessing queues
+    - Double-buffered evaluator in main process: collector + inference threads
+    - Communication via shared memory tensors + lightweight queue messages
     """
 
     def __init__(
@@ -452,7 +560,8 @@ class ParallelSelfPlay:
         """Generate self-play games using multiprocessing.
 
         Uses forkserver context so workers don't inherit the parent's CUDA
-        context (fork would copy GPU memory mappings into each worker).
+        context. Shared memory tensors are allocated before workers spawn
+        so they inherit the /dev/shm handles.
 
         Args:
             num_games: Total games to generate.
@@ -463,24 +572,44 @@ class ParallelSelfPlay:
         num_workers = min(self.config.num_workers, num_games)
         games_per_worker = _distribute_games(num_games, num_workers)
 
-        # Use forkserver: workers are forked from a clean server process
-        # that doesn't have CUDA initialized, avoiding GPU memory inheritance.
-        ctx = mp.get_context("forkserver")
+        # Pre-allocate shared CPU tensors (backed by /dev/shm).
+        # Must be created BEFORE workers spawn so forkserver children
+        # inherit the shared memory file descriptors.
+        max_pending = num_workers * SLOTS_PER_WORKER
+        shared_boards = torch.zeros(max_pending, SEQ_LEN, dtype=torch.long).share_memory_()
+        shared_policies = torch.zeros(max_pending, POLICY_SIZE, dtype=torch.float32).share_memory_()
+        shared_values = torch.zeros(max_pending, dtype=torch.float32).share_memory_()
 
-        # Communication queues (must use same context)
-        eval_request_queue: mp.Queue = ctx.Queue()
+        shm_mb = (
+            shared_boards.numel() * shared_boards.element_size()
+            + shared_policies.numel() * shared_policies.element_size()
+            + shared_values.numel() * shared_values.element_size()
+        ) / 1e6
+        logger.info(
+            "Shared memory: %d workers × %d slots, %.1f MB total (/dev/shm)",
+            num_workers, SLOTS_PER_WORKER, shm_mb,
+        )
+
+        # Use torch.multiprocessing context for correct tensor pickling
+        ctx = tmp.get_context("forkserver")
+
+        # Communication queues
+        eval_request_queue = ctx.Queue()
         result_queues: dict[int, mp.Queue] = {
             i: ctx.Queue() for i in range(num_workers)
         }
-        game_result_queue: mp.Queue = ctx.Queue()
+        game_result_queue = ctx.Queue()
 
-        # Start evaluator thread (runs in main process, has GPU access)
-        evaluator = _EvaluatorThread(
+        # Start double-buffered evaluator (runs in main process, has GPU)
+        evaluator = _DoubleBufferedEvaluator(
             model=self.model,
             device=self.device,
             eval_request_queue=eval_request_queue,
             result_queues=result_queues,
             num_workers=num_workers,
+            shared_boards=shared_boards,
+            shared_policies=shared_policies,
+            shared_values=shared_values,
         )
         evaluator.start()
 
@@ -496,6 +625,7 @@ class ParallelSelfPlay:
                     self.config.temperature, self.config.temperature_threshold,
                     self.config.max_moves,
                     eval_request_queue, result_queues[i], game_result_queue,
+                    shared_boards, shared_policies, shared_values,
                 ),
                 daemon=True,
             )
@@ -534,7 +664,7 @@ class ParallelSelfPlay:
                 workers_done += 1
 
         # Shutdown
-        eval_request_queue.put((_SHUTDOWN_SENTINEL, []))
+        eval_request_queue.put((_SHUTDOWN_SENTINEL, 0, 0))
         evaluator.stop()
         evaluator.join(timeout=5)
 
