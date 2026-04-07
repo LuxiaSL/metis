@@ -31,10 +31,10 @@ import torch
 
 from src.chess.board import BoardEncoder, MoveEncoder, SEQ_LEN, POLICY_SIZE
 from src.chess.mcts import (
-    MCTSConfig, MCTSNode, BatchedMCTS,
-    find_leaf_with_virtual_loss, remove_virtual_loss,
+    MCTSConfig, BatchedMCTS,
     terminal_value, select_move,
 )
+from src.chess.mcts_array import MCTSTree
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ def _run_worker(
 ) -> None:
     """Core worker loop."""
     boards = [chess.Board() for _ in range(num_games)]
-    roots: list[MCTSNode] = [MCTSNode() for _ in range(num_games)]
+    trees: list[MCTSTree] = [MCTSTree() for _ in range(num_games)]
     records = [GameRecord() for _ in range(num_games)]
     ply_counts = [0] * num_games
     active = set(range(num_games))
@@ -157,8 +157,9 @@ def _run_worker(
         boards_to_eval = [boards[i] for i in active_list]
         policies, _ = _request_eval(boards_to_eval)
         for j, i in enumerate(active_list):
-            roots[i].expand(boards[i], policies[j])
-            roots[i].add_dirichlet_noise(
+            trees[i].expand(trees[i].root, boards[i], policies[j])
+            trees[i].add_dirichlet_noise(
+                trees[i].root,
                 mcts_config.dirichlet_alpha, mcts_config.dirichlet_epsilon,
             )
 
@@ -172,34 +173,34 @@ def _run_worker(
         for sim_start in range(0, mcts_config.num_simulations, nvl):
             leaves_per_game = min(nvl, mcts_config.num_simulations - sim_start)
             # Find leaves with virtual loss (parallel within each game)
-            leaves: list[tuple[int, MCTSNode, chess.Board, list[MCTSNode]]] = []
+            leaves: list[tuple[int, int, chess.Board, np.ndarray]] = []
 
             for i in active_list:
                 for _ in range(leaves_per_game):
-                    leaf, search_board, path = find_leaf_with_virtual_loss(
-                        roots[i], boards[i], cpuct,
+                    leaf_idx, search_board, path = trees[i].find_leaf_with_virtual_loss(
+                        boards[i], cpuct,
                     )
-                    if search_board.is_game_over(claim_draw=False):
-                        remove_virtual_loss(path)
-                        leaf.backup(terminal_value(search_board))
+                    if trees[i].is_terminal[leaf_idx] or search_board.is_game_over(claim_draw=False):
+                        trees[i].remove_virtual_loss(path)
+                        trees[i].backup(leaf_idx, terminal_value(search_board))
                     else:
-                        leaves.append((i, leaf, search_board, path))
+                        leaves.append((i, leaf_idx, search_board, path))
 
             # Evaluate leaves.
             if leaves:
                 leaf_boards = [lb for _, _, lb, _ in leaves]
                 policies, values = _request_eval(leaf_boards)
 
-                for j, (_, leaf, lb, path) in enumerate(leaves):
-                    leaf.expand(lb, policies[j])
-                    remove_virtual_loss(path)
-                    leaf.backup(values[j])
+                for j, (game_idx, leaf_idx, lb, path) in enumerate(leaves):
+                    trees[game_idx].expand(leaf_idx, lb, policies[j])
+                    trees[game_idx].remove_virtual_loss(path)
+                    trees[game_idx].backup(leaf_idx, values[j])
 
         # ── Select moves + record positions ────────────────────────
         finished_this_round: list[int] = []
 
         for i in active_list:
-            vc = {m: c.visit_count for m, c in roots[i].children.items()}
+            vc = trees[i].get_visit_counts()
             if not vc:
                 records[i].outcome = _get_outcome(boards[i])
                 finished_this_round.append(i)
@@ -227,30 +228,32 @@ def _run_worker(
                 finished_this_round.append(i)
             else:
                 # Tree reuse: promote chosen child to root
-                if move in roots[i].children:
-                    roots[i] = roots[i].children[move]
-                    roots[i].make_root()
-                    # Add noise to reused root
-                    if roots[i].is_expanded:
-                        roots[i].add_dirichlet_noise(
+                child_idx = trees[i].get_child_for_move(move)
+                if child_idx is not None and trees[i].remaining_capacity() > 20_000:
+                    was_expanded = bool(trees[i].is_expanded[child_idx])
+                    trees[i].reroot(child_idx)
+                    if was_expanded:
+                        trees[i].add_dirichlet_noise(
+                            trees[i].root,
                             mcts_config.dirichlet_alpha,
                             mcts_config.dirichlet_epsilon,
                         )
                 else:
-                    roots[i] = MCTSNode()
+                    trees[i].reset()
 
         # Remove finished games
         for i in finished_this_round:
             active.discard(i)
 
         # Expand any new roots that aren't expanded (from tree reuse miss)
-        unexpanded = [i for i in active if not roots[i].is_expanded]
+        unexpanded = [i for i in active if not trees[i].is_expanded[trees[i].root]]
         if unexpanded:
             boards_to_eval = [boards[i] for i in unexpanded]
             policies, _ = _request_eval(boards_to_eval)
             for j, i in enumerate(unexpanded):
-                roots[i].expand(boards[i], policies[j])
-                roots[i].add_dirichlet_noise(
+                trees[i].expand(trees[i].root, boards[i], policies[j])
+                trees[i].add_dirichlet_noise(
+                    trees[i].root,
                     mcts_config.dirichlet_alpha, mcts_config.dirichlet_epsilon,
                 )
 
@@ -448,6 +451,9 @@ class ParallelSelfPlay:
     def generate_games(self, num_games: int) -> list[GameRecord]:
         """Generate self-play games using multiprocessing.
 
+        Uses forkserver context so workers don't inherit the parent's CUDA
+        context (fork would copy GPU memory mappings into each worker).
+
         Args:
             num_games: Total games to generate.
 
@@ -457,14 +463,18 @@ class ParallelSelfPlay:
         num_workers = min(self.config.num_workers, num_games)
         games_per_worker = _distribute_games(num_games, num_workers)
 
-        # Communication queues
-        eval_request_queue: mp.Queue = mp.Queue()
-        result_queues: dict[int, mp.Queue] = {
-            i: mp.Queue() for i in range(num_workers)
-        }
-        game_result_queue: mp.Queue = mp.Queue()
+        # Use forkserver: workers are forked from a clean server process
+        # that doesn't have CUDA initialized, avoiding GPU memory inheritance.
+        ctx = mp.get_context("forkserver")
 
-        # Start evaluator thread
+        # Communication queues (must use same context)
+        eval_request_queue: mp.Queue = ctx.Queue()
+        result_queues: dict[int, mp.Queue] = {
+            i: ctx.Queue() for i in range(num_workers)
+        }
+        game_result_queue: mp.Queue = ctx.Queue()
+
+        # Start evaluator thread (runs in main process, has GPU access)
         evaluator = _EvaluatorThread(
             model=self.model,
             device=self.device,
@@ -474,12 +484,12 @@ class ParallelSelfPlay:
         )
         evaluator.start()
 
-        # Start worker processes
+        # Start worker processes (CPU-only, no GPU context)
         mcts_config = self.config.to_mcts_config()
         workers: list[mp.Process] = []
 
         for i in range(num_workers):
-            p = mp.Process(
+            p = ctx.Process(
                 target=_worker_fn,
                 args=(
                     i, games_per_worker[i], mcts_config,

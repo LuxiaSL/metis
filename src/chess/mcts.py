@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 from src.chess.board import BoardEncoder, MoveEncoder, POLICY_SIZE
+from src.chess.mcts_array import MCTSTree
 
 
 @dataclass
@@ -42,7 +43,7 @@ class MCTSNode:
 
     __slots__ = [
         "parent", "move", "children", "visit_count",
-        "value_sum", "prior", "_is_expanded",
+        "value_sum", "prior", "_is_expanded", "_is_terminal",
     ]
 
     def __init__(
@@ -58,6 +59,7 @@ class MCTSNode:
         self.value_sum: float = 0.0
         self.prior: float = prior
         self._is_expanded: bool = False
+        self._is_terminal: bool = False
 
     @property
     def q_value(self) -> float:
@@ -70,8 +72,19 @@ class MCTSNode:
         return self._is_expanded
 
     def expand(self, board: chess.Board, policy: np.ndarray) -> None:
-        """Expand with children for all legal moves."""
+        """Expand with children for all legal moves.
+
+        Also checks for terminal positions (insufficient material, 75-move rule,
+        fivefold repetition) so traversal can skip is_game_over() at every level.
+        """
         self._is_expanded = True
+
+        # Check terminal status once during expansion (saves ~5μs × depth × sims
+        # by avoiding redundant is_game_over calls during tree traversal)
+        if board.is_game_over(claim_draw=False):
+            self._is_terminal = True
+            return
+
         children: list[MCTSNode] = []
         total_prior = 0.0
 
@@ -86,6 +99,7 @@ class MCTSNode:
                 continue
 
         if not children:
+            self._is_terminal = True
             return
 
         if total_prior > 0.0:
@@ -165,7 +179,7 @@ def find_leaf_with_virtual_loss(
     node = root
     search_board = board.copy(stack=False)
 
-    while node.is_expanded and not search_board.is_game_over(claim_draw=False):
+    while node.is_expanded and not node._is_terminal:
         move, child = node.select_child(cpuct)
         # Apply virtual loss: inflate visits, add pessimistic value
         child.visit_count += 1
@@ -245,28 +259,23 @@ class MCTS:
         if board.is_game_over(claim_draw=True):
             return {}
 
-        root = MCTSNode()
+        tree = MCTSTree(capacity=50_000)
         policy, _ = self._evaluate(board)
-        root.expand(board, policy)
-        root.add_dirichlet_noise(self.config.dirichlet_alpha, self.config.dirichlet_epsilon)
+        tree.expand(tree.root, board, policy)
+        tree.add_dirichlet_noise(tree.root, self.config.dirichlet_alpha, self.config.dirichlet_epsilon)
 
         for _ in range(self.config.num_simulations):
-            node = root
-            search_board = board.copy(stack=False)
+            node, search_board = tree.find_leaf(board, self.config.cpuct)
 
-            while node.is_expanded and not search_board.is_game_over(claim_draw=False):
-                move, node = node.select_child(self.config.cpuct)
-                search_board.push(move)
-
-            if search_board.is_game_over(claim_draw=False):
+            if tree.is_terminal[node] or search_board.is_game_over(claim_draw=False):
                 value = terminal_value(search_board)
             else:
                 policy, value = self._evaluate(search_board)
-                node.expand(search_board, policy)
+                tree.expand(node, search_board, policy)
 
-            node.backup(value)
+            tree.backup(node, value)
 
-        return {move: child.visit_count for move, child in root.children.items()}
+        return tree.get_visit_counts()
 
 
 # ── Batched MCTS (single-process, for fallback) ───────────────────────────
@@ -308,7 +317,7 @@ class BatchedMCTS:
     ) -> list[dict[chess.Move, int]]:
         """Run MCTS for multiple positions with batched evaluation + virtual loss."""
         n = len(boards)
-        roots: list[MCTSNode] = [MCTSNode() for _ in range(n)]
+        trees: list[MCTSTree] = [MCTSTree(capacity=50_000) for _ in range(n)]
         active = [i for i, b in enumerate(boards) if not b.is_game_over(claim_draw=True)]
 
         # Initial expansion
@@ -316,8 +325,9 @@ class BatchedMCTS:
             active_boards = [boards[i] for i in active]
             policies, _ = self._batched_evaluate(active_boards)
             for j, idx in enumerate(active):
-                roots[idx].expand(boards[idx], policies[j])
-                roots[idx].add_dirichlet_noise(
+                trees[idx].expand(trees[idx].root, boards[idx], policies[j])
+                trees[idx].add_dirichlet_noise(
+                    trees[idx].root,
                     self.config.dirichlet_alpha, self.config.dirichlet_epsilon,
                 )
 
@@ -326,29 +336,26 @@ class BatchedMCTS:
 
         for sim_start in range(0, self.config.num_simulations, nvl):
             leaves_per_game = min(nvl, self.config.num_simulations - sim_start)
-            leaves: list[tuple[int, MCTSNode, chess.Board, list[MCTSNode]]] = []
+            leaves: list[tuple[int, int, chess.Board, np.ndarray]] = []
 
             for i in active:
                 for _ in range(leaves_per_game):
-                    leaf, search_board, path = find_leaf_with_virtual_loss(
-                        roots[i], boards[i], self.config.cpuct,
+                    leaf_idx, search_board, path = trees[i].find_leaf_with_virtual_loss(
+                        boards[i], self.config.cpuct,
                     )
-                    if search_board.is_game_over(claim_draw=False):
-                        remove_virtual_loss(path)
-                        leaf.backup(terminal_value(search_board))
+                    if trees[i].is_terminal[leaf_idx] or search_board.is_game_over(claim_draw=False):
+                        trees[i].remove_virtual_loss(path)
+                        trees[i].backup(leaf_idx, terminal_value(search_board))
                     else:
-                        leaves.append((i, leaf, search_board, path))
+                        leaves.append((i, leaf_idx, search_board, path))
 
             if leaves:
                 leaf_boards = [lb for _, _, lb, _ in leaves]
                 policies, values = self._batched_evaluate(leaf_boards)
 
-                for j, (_, leaf, _, path) in enumerate(leaves):
-                    leaf.expand(leaf_boards[j], policies[j])
-                    remove_virtual_loss(path)
-                    leaf.backup(values[j])
+                for j, (game_idx, leaf_idx, lb, path) in enumerate(leaves):
+                    trees[game_idx].expand(leaf_idx, lb, policies[j])
+                    trees[game_idx].remove_virtual_loss(path)
+                    trees[game_idx].backup(leaf_idx, values[j])
 
-        return [
-            {move: child.visit_count for move, child in root.children.items()}
-            for root in roots
-        ]
+        return [tree.get_visit_counts() for tree in trees]
