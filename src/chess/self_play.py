@@ -34,9 +34,12 @@ import torch
 import torch.multiprocessing as tmp
 
 from src.chess.board import BoardEncoder, MoveEncoder, SEQ_LEN, POLICY_SIZE
+from src.chess.bitboard import Board as BitboardBoard
 from src.chess.mcts import (
-    MCTSConfig, BatchedMCTS,
+    MCTSConfig, BatchedMCTS, GumbelConfig,
     terminal_value, select_move,
+    gumbel_top_k, sequential_halving, compute_sigma,
+    compute_improved_policy, select_gumbel_move,
 )
 from src.chess.mcts_array import MCTSTree
 
@@ -49,6 +52,7 @@ class GameRecord:
 
     positions: list[torch.Tensor] = field(default_factory=list)
     policies: list[torch.Tensor] = field(default_factory=list)
+    activities: list[float] = field(default_factory=list)
     outcome: float = 0.0
 
     def __len__(self) -> int:
@@ -70,6 +74,11 @@ class SelfPlayConfig:
     temperature_threshold: int = 30
     max_moves: int = 200
 
+    # Gumbel AlphaZero settings
+    mcts_algorithm: str = "alphazero"  # "alphazero" or "gumbel"
+    gumbel_K: int = 16
+    gumbel_c_visit: float = 50.0
+
     def to_mcts_config(self) -> MCTSConfig:
         return MCTSConfig(
             num_simulations=self.mcts_simulations,
@@ -77,6 +86,14 @@ class SelfPlayConfig:
             dirichlet_alpha=self.dirichlet_alpha,
             dirichlet_epsilon=self.dirichlet_epsilon,
             num_virtual_leaves=self.num_virtual_leaves,
+        )
+
+    def to_gumbel_config(self) -> GumbelConfig:
+        return GumbelConfig(
+            num_simulations=self.mcts_simulations,
+            max_K=self.gumbel_K,
+            c_visit=self.gumbel_c_visit,
+            cpuct=self.cpuct,
         )
 
 
@@ -88,6 +105,48 @@ class SelfPlayConfig:
 
 _SHUTDOWN_SENTINEL = -1
 SLOTS_PER_WORKER = 64  # static allocation: worker i owns [i*64 : (i+1)*64]
+
+# Piece values for material adjudication (standard centipawn / 100)
+_PIECE_VALUES = {
+    chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+    chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0,
+}
+
+
+def _material_adjudicate(board: chess.Board, threshold: float = 3.0) -> float:
+    """Adjudicate based on material balance when max_moves is reached.
+
+    Returns +1 (white wins), -1 (black wins), or 0 (draw) based on whether
+    the material imbalance exceeds the threshold. Gives the value head signal
+    from positions that would otherwise all be labeled as draws.
+    """
+    white_material = sum(
+        _PIECE_VALUES[pt] * len(board.pieces(pt, chess.WHITE))
+        for pt in _PIECE_VALUES
+    )
+    black_material = sum(
+        _PIECE_VALUES[pt] * len(board.pieces(pt, chess.BLACK))
+        for pt in _PIECE_VALUES
+    )
+    diff = white_material - black_material
+    if diff > threshold:
+        return 1.0
+    elif diff < -threshold:
+        return -1.0
+    return 0.0
+
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    """Compute softmax over the last axis (numerically stable)."""
+    x = logits - logits.max(axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def _legal_move_count(board: chess.Board) -> int:
+    if isinstance(board, BitboardBoard):
+        return board.legal_move_count()
+    return len(list(board.legal_moves))
 
 
 # ── Worker process ─────────────────────────────────────────────────────────
@@ -106,6 +165,8 @@ def _worker_fn(
     shared_boards: torch.Tensor,
     shared_policies: torch.Tensor,
     shared_values: torch.Tensor,
+    mcts_algorithm: str = "alphazero",
+    gumbel_config: Optional[GumbelConfig] = None,
 ) -> None:
     """Worker process: manages MCTS trees for assigned games (CPU only).
 
@@ -120,6 +181,8 @@ def _worker_fn(
             temperature_threshold, max_moves,
             eval_request_queue, eval_result_queue, game_result_queue,
             shared_boards, shared_policies, shared_values,
+            mcts_algorithm=mcts_algorithm,
+            gumbel_config=gumbel_config,
         )
     except Exception as e:
         logger.error("Worker %d crashed: %s", worker_id, e, exc_info=True)
@@ -140,6 +203,8 @@ def _run_worker(
     shared_boards: torch.Tensor,
     shared_policies: torch.Tensor,
     shared_values: torch.Tensor,
+    mcts_algorithm: str = "alphazero",
+    gumbel_config: Optional[GumbelConfig] = None,
 ) -> None:
     """Core worker loop using shared memory for board/policy/value transfer."""
     # Numpy views of shared tensors (zero-copy, backed by /dev/shm)
@@ -148,7 +213,7 @@ def _run_worker(
     policies_np = shared_policies.numpy()
     values_np = shared_values.numpy()
 
-    boards = [chess.Board() for _ in range(num_games)]
+    boards = [BitboardBoard() for _ in range(num_games)]
     trees: list[MCTSTree] = [MCTSTree() for _ in range(num_games)]
     records = [GameRecord() for _ in range(num_games)]
     ply_counts = [0] * num_games
@@ -176,15 +241,25 @@ def _run_worker(
         # our slots won't be overwritten until we send the next request)
         return policies_np[slot_base:slot_base + count], values_np[slot_base:slot_base + count]
 
+    use_gumbel = mcts_algorithm == "gumbel" and gumbel_config is not None
+    # Per-game storage for raw logits + root values (needed by Gumbel)
+    root_logits: list[Optional[np.ndarray]] = [None] * num_games
+    root_values: list[float] = [0.0] * num_games
+
     def _expand_roots() -> None:
         """Expand root nodes for all active games via NN evaluation."""
         active_list = sorted(active)
         if not active_list:
             return
         boards_to_eval = [boards[i] for i in active_list]
-        policies, _ = _request_eval(boards_to_eval)
+        logits_batch, values_batch = _request_eval(boards_to_eval)
         for j, i in enumerate(active_list):
-            trees[i].expand(trees[i].root, boards[i], policies[j])
+            # Store raw logits and value for Gumbel path
+            root_logits[i] = logits_batch[j].copy()
+            root_values[i] = float(values_batch[j])
+            # Softmax for tree expansion priors
+            probs = _softmax(logits_batch[j:j+1])[0]
+            trees[i].expand(trees[i].root, boards[i], probs)
             trees[i].add_dirichlet_noise(
                 trees[i].root,
                 mcts_config.dirichlet_alpha, mcts_config.dirichlet_epsilon,
@@ -193,92 +268,176 @@ def _run_worker(
     # Initial expansion
     _expand_roots()
 
+    def _eval_single(b: chess.Board) -> tuple[np.ndarray, float]:
+        """Evaluate a single board position via the shared evaluator.
+
+        Returns (softmax_policy, value). Used by sequential_halving for
+        leaf expansion during Gumbel search.
+        """
+        logits_batch, values_batch = _request_eval([b])
+        return _softmax(logits_batch[0:1])[0], float(values_batch[0])
+
+    # Track selected moves per game for tree reuse
+    selected_moves: dict[int, Optional[chess.Move]] = {}
+
     while active:
-        # ── MCTS simulations ───────────────────────────────────────
         active_list = sorted(active)
+        selected_moves.clear()
 
-        for sim_start in range(0, mcts_config.num_simulations, nvl):
-            leaves_per_game = min(nvl, mcts_config.num_simulations - sim_start)
-            # Find leaves with virtual loss (parallel within each game)
-            leaves: list[tuple[int, int, chess.Board, np.ndarray]] = []
-
+        if use_gumbel:
+            # ── Gumbel AlphaZero search ───────────────────────────
+            assert gumbel_config is not None
             for i in active_list:
-                for _ in range(leaves_per_game):
-                    leaf_idx, search_board, path = trees[i].find_leaf_with_virtual_loss(
-                        boards[i], cpuct,
+                logits_i = root_logits[i]
+                if logits_i is None:
+                    selected_moves[i] = None
+                    continue
+
+                legal_moves = list(boards[i].legal_moves)
+                if not legal_moves:
+                    records[i].outcome = _get_outcome(boards[i])
+                    selected_moves[i] = None
+                    continue
+
+                # Gumbel-Top-K: sample K candidate moves
+                K = min(gumbel_config.max_K, len(legal_moves))
+                legal_indices = [MoveEncoder.move_to_index(m) for m in legal_moves]
+                selected_indices, gumbel_scores = gumbel_top_k(logits_i, legal_indices, K)
+
+                # Map selected indices back to moves
+                idx_to_move = {MoveEncoder.move_to_index(m): m for m in legal_moves}
+                candidate_moves = [idx_to_move[si] for si in selected_indices]
+
+                # Sequential Halving
+                winner = sequential_halving(
+                    trees[i], boards[i], candidate_moves,
+                    gumbel_config.num_simulations, _eval_single,
+                    gumbel_config.cpuct,
+                )
+
+                # Completed Q-values for ALL legal moves
+                completed_q = trees[i].get_completed_q_values(
+                    root_values[i], legal_moves,
+                )
+
+                # Improved policy target
+                sigma = compute_sigma(completed_q, gumbel_config.c_visit)
+                improved_policy = compute_improved_policy(
+                    logits_i, completed_q, legal_moves, sigma,
+                )
+
+                # Record position with improved policy
+                records[i].positions.append(BoardEncoder.encode_board(boards[i]))
+                records[i].policies.append(torch.from_numpy(improved_policy))
+                records[i].activities.append(_legal_move_count(boards[i]) / 40.0)
+
+                # Select move: use Gumbel scores + Q for exploration early,
+                # deterministic (winner) later
+                ply = ply_counts[i]
+                if ply < temperature_threshold:
+                    q_values = trees[i].get_child_q_values(negate=True)
+                    move = select_gumbel_move(
+                        candidate_moves, gumbel_scores, q_values, sigma,
                     )
-                    if trees[i].is_terminal[leaf_idx] or search_board.is_game_over(claim_draw=False):
-                        trees[i].remove_virtual_loss(path)
-                        trees[i].backup(leaf_idx, terminal_value(search_board))
-                    else:
-                        leaves.append((i, leaf_idx, search_board, path))
+                else:
+                    move = winner
 
-            # Evaluate leaves.
-            if leaves:
-                leaf_boards = [lb for _, _, lb, _ in leaves]
-                policies, values = _request_eval(leaf_boards)
+                boards[i].push(move)
+                ply_counts[i] += 1
+                selected_moves[i] = move
 
-                for j, (game_idx, leaf_idx, lb, path) in enumerate(leaves):
-                    trees[game_idx].expand(leaf_idx, lb, policies[j])
-                    trees[game_idx].remove_virtual_loss(path)
-                    trees[game_idx].backup(leaf_idx, values[j])
+        else:
+            # ── Standard AlphaZero MCTS ───────────────────────────
+            for sim_start in range(0, mcts_config.num_simulations, nvl):
+                leaves_per_game = min(nvl, mcts_config.num_simulations - sim_start)
+                leaves: list[tuple[int, int, chess.Board, np.ndarray]] = []
 
-        # ── Select moves + record positions ────────────────────────
+                for i in active_list:
+                    for _ in range(leaves_per_game):
+                        leaf_idx, search_board, path = trees[i].find_leaf_with_virtual_loss(
+                            boards[i], cpuct,
+                        )
+                        if trees[i].is_terminal[leaf_idx] or search_board.is_game_over(claim_draw=False):
+                            trees[i].remove_virtual_loss(path)
+                            trees[i].backup(leaf_idx, terminal_value(search_board))
+                        else:
+                            leaves.append((i, leaf_idx, search_board, path))
+
+                if leaves:
+                    leaf_boards = [lb for _, _, lb, _ in leaves]
+                    logits_batch, values = _request_eval(leaf_boards)
+
+                    for j, (game_idx, leaf_idx, lb, path) in enumerate(leaves):
+                        probs = _softmax(logits_batch[j:j+1])[0]
+                        trees[game_idx].expand(leaf_idx, lb, probs)
+                        trees[game_idx].remove_virtual_loss(path)
+                        trees[game_idx].backup(leaf_idx, values[j])
+
+            # Select moves for AlphaZero path
+            for i in active_list:
+                vc = trees[i].get_visit_counts()
+                if not vc:
+                    records[i].outcome = _get_outcome(boards[i])
+                    selected_moves[i] = None
+                    continue
+
+                records[i].positions.append(BoardEncoder.encode_board(boards[i]))
+                records[i].policies.append(MoveEncoder.encode_policy(vc))
+                records[i].activities.append(_legal_move_count(boards[i]) / 40.0)
+
+                ply = ply_counts[i]
+                temp = temperature if ply < temperature_threshold else 0.0
+                move = select_move(vc, temp)
+
+                boards[i].push(move)
+                ply_counts[i] += 1
+                selected_moves[i] = move
+
+        # ── Check termination + tree management (both algorithms) ──
         finished_this_round: list[int] = []
 
         for i in active_list:
-            vc = trees[i].get_visit_counts()
-            if not vc:
-                records[i].outcome = _get_outcome(boards[i])
+            move = selected_moves.get(i)
+            if move is None:
+                # No valid move — game already marked as finished above
                 finished_this_round.append(i)
-                continue
-
-            # Record position and MCTS policy
-            records[i].positions.append(BoardEncoder.encode_board(boards[i]))
-            records[i].policies.append(MoveEncoder.encode_policy(vc))
-
-            # Select move
-            ply = ply_counts[i]
-            temp = temperature if ply < temperature_threshold else 0.0
-            move = select_move(vc, temp)
-
-            # Play move
-            boards[i].push(move)
-            ply_counts[i] += 1
-
-            # Check termination
-            if boards[i].is_game_over(claim_draw=True):
+            elif boards[i].is_game_over(claim_draw=True):
                 records[i].outcome = _get_outcome(boards[i])
                 finished_this_round.append(i)
             elif ply_counts[i] >= max_moves:
-                records[i].outcome = 0.0
+                records[i].outcome = _material_adjudicate(boards[i])
                 finished_this_round.append(i)
             else:
-                # Tree reuse: promote chosen child to root
-                child_idx = trees[i].get_child_for_move(move)
-                if child_idx is not None and trees[i].remaining_capacity() > 20_000:
-                    was_expanded = bool(trees[i].is_expanded[child_idx])
-                    trees[i].reroot(child_idx)
-                    if was_expanded:
-                        trees[i].add_dirichlet_noise(
-                            trees[i].root,
-                            mcts_config.dirichlet_alpha,
-                            mcts_config.dirichlet_epsilon,
-                        )
-                else:
+                # Tree reuse (AlphaZero) or fresh tree (Gumbel)
+                if use_gumbel:
                     trees[i].reset()
+                else:
+                    child_idx = trees[i].get_child_for_move(move)
+                    if child_idx is not None and trees[i].remaining_capacity() > 20_000:
+                        was_expanded = bool(trees[i].is_expanded[child_idx])
+                        trees[i].reroot(child_idx)
+                        if was_expanded:
+                            trees[i].add_dirichlet_noise(
+                                trees[i].root,
+                                mcts_config.dirichlet_alpha,
+                                mcts_config.dirichlet_epsilon,
+                            )
+                    else:
+                        trees[i].reset()
 
-        # Remove finished games
         for i in finished_this_round:
             active.discard(i)
 
-        # Expand any new roots that aren't expanded (from tree reuse miss)
+        # Expand any new roots that aren't expanded
         unexpanded = [i for i in active if not trees[i].is_expanded[trees[i].root]]
         if unexpanded:
             boards_to_eval = [boards[i] for i in unexpanded]
-            policies, _ = _request_eval(boards_to_eval)
+            logits_batch, values_batch = _request_eval(boards_to_eval)
             for j, i in enumerate(unexpanded):
-                trees[i].expand(trees[i].root, boards[i], policies[j])
+                root_logits[i] = logits_batch[j].copy()
+                root_values[i] = float(values_batch[j])
+                probs = _softmax(logits_batch[j:j+1])[0]
+                trees[i].expand(trees[i].root, boards[i], probs)
                 trees[i].add_dirichlet_noise(
                     trees[i].root,
                     mcts_config.dirichlet_alpha, mcts_config.dirichlet_epsilon,
@@ -289,6 +448,7 @@ def _run_worker(
         serialized = {
             "positions": [p.numpy() for p in record.positions],
             "policies": [p.numpy() for p in record.policies],
+            "activities": record.activities,
             "outcome": record.outcome,
         }
         game_result_queue.put(("game", worker_id, serialized))
@@ -440,9 +600,19 @@ class _DoubleBufferedEvaluator:
 
     def _inference_loop(self) -> None:
         """Process batches on GPU, write results to shared memory."""
+        # Timing accumulators for profiling (reset every 500 batches)
+        _t_gather = 0.0
+        _t_inference = 0.0
+        _t_writeback = 0.0
+        _t_notify = 0.0
+        _t_wait = 0.0
+        _prof_batches = 0
+
         while not self._stop_event.is_set():
+            _tw0 = time.monotonic()
             self._batch_ready.wait()
             self._batch_ready.clear()
+            _t_wait += time.monotonic() - _tw0
 
             if self._stop_event.is_set():
                 break
@@ -458,39 +628,65 @@ class _DoubleBufferedEvaluator:
 
             if total_positions > 0:
                 # Gather boards from shared memory into a contiguous tensor
+                _tg0 = time.monotonic()
                 slices: list[torch.Tensor] = []
                 for _, slot_offset, count in batch:
                     if count > 0:
                         slices.append(self.shared_boards[slot_offset:slot_offset + count])
                 board_tensor = torch.cat(slices, dim=0)
+                _t_gather += time.monotonic() - _tg0
 
                 # GPU inference (releases GIL — collector runs concurrently)
+                _ti0 = time.monotonic()
                 policies, values = self._evaluate_batch(board_tensor)
+                _t_inference += time.monotonic() - _ti0
 
                 # Write results back to shared memory at each worker's slots
+                _tw0 = time.monotonic()
                 idx = 0
                 for _, slot_offset, count in batch:
                     if count > 0:
                         self._policies_np[slot_offset:slot_offset + count] = policies[idx:idx + count]
                         self._values_np[slot_offset:slot_offset + count] = values[idx:idx + count]
                         idx += count
+                _t_writeback += time.monotonic() - _tw0
 
             # Notify all workers in this batch (GIL-bound, keep minimal)
+            _tn0 = time.monotonic()
             for worker_id, _, _ in batch:
                 self.result_queues[worker_id].put(True)
+            _t_notify += time.monotonic() - _tn0
 
             self._total_evals += total_positions
             self._total_batches += 1
+            _prof_batches += 1
 
-            # Periodic progress log
+            # Periodic progress log with timing breakdown
             if self._total_batches % 500 == 0:
                 elapsed = time.monotonic() - self._start_time
-                logger.info(
-                    "Evaluator: %d evals, %d batches (avg %.1f/batch, %.0f evals/s)",
-                    self._total_evals, self._total_batches,
-                    self._total_evals / max(self._total_batches, 1),
-                    self._total_evals / max(elapsed, 1e-6),
-                )
+                total_prof = _t_gather + _t_inference + _t_writeback + _t_notify + _t_wait
+                if total_prof > 0 and _prof_batches > 0:
+                    logger.info(
+                        "Evaluator: %d evals, %d batches (avg %.1f/batch, %.0f evals/s) "
+                        "| wait %.0f%% gather %.0f%% infer %.0f%% write %.0f%% notify %.0f%%",
+                        self._total_evals, self._total_batches,
+                        self._total_evals / max(self._total_batches, 1),
+                        self._total_evals / max(elapsed, 1e-6),
+                        _t_wait / total_prof * 100,
+                        _t_gather / total_prof * 100,
+                        _t_inference / total_prof * 100,
+                        _t_writeback / total_prof * 100,
+                        _t_notify / total_prof * 100,
+                    )
+                else:
+                    logger.info(
+                        "Evaluator: %d evals, %d batches (avg %.1f/batch, %.0f evals/s)",
+                        self._total_evals, self._total_batches,
+                        self._total_evals / max(self._total_batches, 1),
+                        self._total_evals / max(elapsed, 1e-6),
+                    )
+                _t_gather = _t_inference = _t_writeback = _t_notify = _t_wait = 0.0
+                _prof_batches = 0
 
             self._inference_idle.set()
 
@@ -498,11 +694,11 @@ class _DoubleBufferedEvaluator:
     def _evaluate_batch(
         self,
         board_tensor: torch.Tensor,
-        max_sub_batch: int = 128,
+        max_sub_batch: int = 4096,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Run model inference on a contiguous batch of encoded boards.
 
-        Splits large batches into sub-batches to avoid OOM on shared GPUs.
+        Splits large batches into sub-batches if they exceed max_sub_batch.
 
         Args:
             board_tensor: (N, 67) long tensor on CPU from shared memory.
@@ -517,21 +713,26 @@ class _DoubleBufferedEvaluator:
         if n <= max_sub_batch:
             batch = board_tensor.to(self.device)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-                policy_logits, vals = self.model(batch)
-            policies = torch.softmax(policy_logits.float(), dim=-1).cpu().numpy()
-            values = vals.squeeze(-1).float().cpu().numpy()
-            return policies, values
+                policy_logits, wdl_logits, _, _ = self.model(batch)
+            # Return raw logits (workers compute softmax locally when needed).
+            # This enables Gumbel search which needs raw logits, and doesn't
+            # hurt AlphaZero since expand() normalizes priors anyway.
+            logits = policy_logits.float().cpu().numpy()
+            wdl_probs = torch.softmax(wdl_logits.float(), dim=-1)
+            values = (wdl_probs[:, 2] - wdl_probs[:, 0]).cpu().numpy()
+            return logits, values
 
-        # Sub-batch for VRAM safety
-        all_policies: list[np.ndarray] = []
+        # Sub-batch fallback for very large batches
+        all_logits: list[np.ndarray] = []
         all_values: list[np.ndarray] = []
         for start in range(0, n, max_sub_batch):
             sub = board_tensor[start:start + max_sub_batch].to(self.device)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-                policy_logits, vals = self.model(sub)
-            all_policies.append(torch.softmax(policy_logits.float(), dim=-1).cpu().numpy())
-            all_values.append(vals.squeeze(-1).float().cpu().numpy())
-        return np.concatenate(all_policies), np.concatenate(all_values)
+                policy_logits, wdl_logits, _, _ = self.model(sub)
+            all_logits.append(policy_logits.float().cpu().numpy())
+            wdl_probs = torch.softmax(wdl_logits.float(), dim=-1)
+            all_values.append((wdl_probs[:, 2] - wdl_probs[:, 0]).cpu().numpy())
+        return np.concatenate(all_logits), np.concatenate(all_values)
 
 
 # ── Parallel self-play (production) ────────────────────────────────────────
@@ -556,7 +757,11 @@ class ParallelSelfPlay:
         self.config = config
         self.device = device
 
-    def generate_games(self, num_games: int) -> list[GameRecord]:
+    def generate_games(
+        self,
+        num_games: int,
+        shutdown_event: Optional[threading.Event] = None,
+    ) -> list[GameRecord]:
         """Generate self-play games using multiprocessing.
 
         Uses forkserver context so workers don't inherit the parent's CUDA
@@ -565,9 +770,10 @@ class ParallelSelfPlay:
 
         Args:
             num_games: Total games to generate.
+            shutdown_event: If set, abort self-play early for graceful shutdown.
 
         Returns:
-            List of completed GameRecords.
+            List of completed GameRecords (may be partial on shutdown).
         """
         num_workers = min(self.config.num_workers, num_games)
         games_per_worker = _distribute_games(num_games, num_workers)
@@ -615,6 +821,7 @@ class ParallelSelfPlay:
 
         # Start worker processes (CPU-only, no GPU context)
         mcts_config = self.config.to_mcts_config()
+        gumbel_cfg = self.config.to_gumbel_config() if self.config.mcts_algorithm == "gumbel" else None
         workers: list[mp.Process] = []
 
         for i in range(num_workers):
@@ -626,6 +833,7 @@ class ParallelSelfPlay:
                     self.config.max_moves,
                     eval_request_queue, result_queues[i], game_result_queue,
                     shared_boards, shared_policies, shared_values,
+                    self.config.mcts_algorithm, gumbel_cfg,
                 ),
                 daemon=True,
             )
@@ -638,11 +846,15 @@ class ParallelSelfPlay:
         errors: list[str] = []
 
         while workers_done < num_workers:
+            # Use short timeout so we can check shutdown_event frequently
             try:
-                msg_type, worker_id, payload = game_result_queue.get(timeout=3600)
+                msg_type, worker_id, payload = game_result_queue.get(timeout=2.0)
             except queue.Empty:
-                logger.warning("Timeout waiting for worker results (3600s)")
-                break
+                if shutdown_event is not None and shutdown_event.is_set():
+                    logger.info("Self-play interrupted by shutdown (%d/%d games collected)",
+                                len(completed_games), num_games)
+                    break
+                continue
 
             if msg_type == "game":
                 if len(completed_games) % 10 == 0 and len(completed_games) > 0:
@@ -654,6 +866,7 @@ class ParallelSelfPlay:
                 record = GameRecord(
                     positions=[torch.from_numpy(p) for p in payload["positions"]],
                     policies=[torch.from_numpy(p) for p in payload["policies"]],
+                    activities=payload.get("activities", []),
                     outcome=payload["outcome"],
                 )
                 completed_games.append(record)
@@ -707,11 +920,17 @@ class SelfPlayWorker:
             model=model, config=config.to_mcts_config(), device=device,
         )
 
-    def generate_games(self, num_games: int) -> list[GameRecord]:
+    def generate_games(
+        self,
+        num_games: int,
+        shutdown_event: Optional[threading.Event] = None,
+    ) -> list[GameRecord]:
         completed: list[GameRecord] = []
         remaining = num_games
 
         while remaining > 0:
+            if shutdown_event is not None and shutdown_event.is_set():
+                break
             batch_size = min(remaining, self.config.num_parallel)
             batch_games = self._play_batch(batch_size)
             completed.extend(batch_games)
@@ -724,7 +943,7 @@ class SelfPlayWorker:
         return completed
 
     def _play_batch(self, batch_size: int) -> list[GameRecord]:
-        boards = [chess.Board() for _ in range(batch_size)]
+        boards = [BitboardBoard() for _ in range(batch_size)]
         records = [GameRecord() for _ in range(batch_size)]
         active = list(range(batch_size))
         ply_counts = [0] * batch_size
@@ -745,6 +964,7 @@ class SelfPlayWorker:
 
                 record.positions.append(BoardEncoder.encode_board(board))
                 record.policies.append(MoveEncoder.encode_policy(vc))
+                record.activities.append(_legal_move_count(board) / 40.0)
 
                 ply = ply_counts[game_idx]
                 temp = self.config.temperature if ply < self.config.temperature_threshold else 0.0
@@ -756,7 +976,7 @@ class SelfPlayWorker:
                 if board.is_game_over(claim_draw=True):
                     record.outcome = _get_outcome(board)
                 elif ply_counts[game_idx] >= self.config.max_moves:
-                    record.outcome = 0.0
+                    record.outcome = _material_adjudicate(board)
                 else:
                     next_active.append(game_idx)
 

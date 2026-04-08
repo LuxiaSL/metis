@@ -2,9 +2,9 @@
 
 Key differences from the language model:
 - Bidirectional attention (no causal mask) — all squares see all squares
-- Learned positional embeddings (no RoPE) — fixed board geometry
+- Shaw-style relative position bias — chess-aware topology encoding
 - Chess-specific input encoding: piece type + global state tokens
-- Dual heads: policy (8x8x73 = 4672 move logits) + value (scalar [-1, 1])
+- WDL value head (win/draw/loss 3-class) + material & activity aux heads
 - z-loss on policy logits prevents explosion during RL training
 
 Preserved from luxia-base:
@@ -168,11 +168,98 @@ class RMSNorm(nn.Module):
         return x * norm * self.weight
 
 
+class RelativePositionBias(nn.Module):
+    """Shaw-style relative position bias with chess-aware topology features.
+
+    For each pair of positions (i, j) in the 67-token sequence, computes a
+    scalar bias added to attention logits before softmax. Encodes chess-relevant
+    spatial relationships between squares.
+
+    Features for square pairs (positions 3-66 → squares a1-h8):
+    - Rank difference (0-7): captures vertical distance
+    - File difference (0-7): captures horizontal distance
+    - Same diagonal: captures bishop-like relationships
+    - Same anti-diagonal: captures the other diagonal
+    - Knight-reachable: captures knight move topology
+
+    Global tokens (0-2: castling, en passant, side) get separate learned biases.
+    """
+
+    def __init__(self, config: ChessModelConfig) -> None:
+        super().__init__()
+        seq_len = config.seq_len  # 67
+        n_global = config.num_global_tokens  # 3
+
+        # Embeddings for distance features (shared across all square pairs)
+        self.rank_diff_embed = nn.Embedding(8, 1)  # |rank_i - rank_j| ∈ [0, 7]
+        self.file_diff_embed = nn.Embedding(8, 1)  # |file_i - file_j| ∈ [0, 7]
+
+        # Learned scalars for boolean features
+        self.diag_bias = nn.Parameter(torch.zeros(1))
+        self.antidiag_bias = nn.Parameter(torch.zeros(1))
+        self.knight_bias = nn.Parameter(torch.zeros(1))
+
+        # Global token biases: each global token has learned bias to/from all positions
+        self.global_bias = nn.Parameter(torch.zeros(n_global, seq_len))
+
+        # Precompute topology feature indices for the 64x64 square block
+        rank_diff = torch.zeros(64, 64, dtype=torch.long)
+        file_diff = torch.zeros(64, 64, dtype=torch.long)
+        same_diag = torch.zeros(64, 64, dtype=torch.bool)
+        same_antidiag = torch.zeros(64, 64, dtype=torch.bool)
+        knight_reach = torch.zeros(64, 64, dtype=torch.bool)
+
+        for sq_i in range(64):
+            ri, fi = sq_i // 8, sq_i % 8
+            for sq_j in range(64):
+                rj, fj = sq_j // 8, sq_j % 8
+                dr, df = abs(ri - rj), abs(fi - fj)
+                rank_diff[sq_i, sq_j] = dr
+                file_diff[sq_i, sq_j] = df
+                same_diag[sq_i, sq_j] = (ri - fi) == (rj - fj)
+                same_antidiag[sq_i, sq_j] = (ri + fi) == (rj + fj)
+                knight_reach[sq_i, sq_j] = (dr == 2 and df == 1) or (dr == 1 and df == 2)
+
+        self.register_buffer("_rank_diff", rank_diff)
+        self.register_buffer("_file_diff", file_diff)
+        self.register_buffer("_same_diag", same_diag.float())
+        self.register_buffer("_same_antidiag", same_antidiag.float())
+        self.register_buffer("_knight_reach", knight_reach.float())
+        self._seq_len = seq_len
+        self._n_global = n_global
+
+    def forward(self) -> torch.Tensor:
+        """Compute the (1, 1, 67, 67) relative position bias matrix."""
+        bias = torch.zeros(
+            self._seq_len, self._seq_len,
+            device=self._rank_diff.device, dtype=self.rank_diff_embed.weight.dtype,
+        )
+
+        # Square-to-square biases (positions 3-66)
+        g = self._n_global
+        sq_bias = (
+            self.rank_diff_embed(self._rank_diff).squeeze(-1)
+            + self.file_diff_embed(self._file_diff).squeeze(-1)
+            + self._same_diag * self.diag_bias
+            + self._same_antidiag * self.antidiag_bias
+            + self._knight_reach * self.knight_bias
+        )
+        bias[g:, g:] = sq_bias
+
+        # Global token biases: global→all (rows) and square→global (columns)
+        # Row assignment covers global→global and global→square
+        # Column assignment adds square→global only (avoids double-counting g×g block)
+        bias[:g, :] = self.global_bias              # (3, 67): global tokens attend to everything
+        bias[g:, :g] = self.global_bias[:, g:].T    # (64, 3): squares attend to global tokens
+
+        return bias.unsqueeze(0).unsqueeze(0)  # (1, 1, 67, 67)
+
+
 class GQAttention(nn.Module):
     """Grouped-Query Attention with optional QK-norm.
 
-    Bidirectional (no causal mask). No RoPE — positional info comes from
-    learned embeddings added before the transformer.
+    Bidirectional (no causal mask). Positional info comes from relative
+    position bias added to attention scores.
 
     Supports SDPA and FA2 backends.
     """
@@ -195,7 +282,9 @@ class GQAttention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=config.norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=config.norm_eps)
 
-    def _forward_sdpa(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_sdpa(
+        self, x: torch.Tensor, attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """SDPA path: (B, nheads, S, D) layout, bidirectional."""
         bsz, seq_len, _ = x.shape
 
@@ -209,6 +298,7 @@ class GQAttention(nn.Module):
 
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
+            attn_mask=attn_bias,  # additive bias (1, 1, S, S) or None
             is_causal=False,
             enable_gqa=True,
         )
@@ -216,8 +306,17 @@ class GQAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.o_proj(attn_output)
 
-    def _forward_fa2(self, x: torch.Tensor) -> torch.Tensor:
-        """FA2 path: (B, S, nheads, D) layout, bidirectional."""
+    def _forward_fa2(
+        self, x: torch.Tensor, attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """FA2 path: (B, S, nheads, D) layout, bidirectional.
+
+        FA2 doesn't support arbitrary attention biases. If attn_bias is provided,
+        falls back to SDPA.
+        """
+        if attn_bias is not None:
+            return self._forward_sdpa(x, attn_bias=attn_bias)
+
         bsz, seq_len, _ = x.shape
 
         q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)
@@ -235,10 +334,12 @@ class GQAttention(nn.Module):
         attn_output = attn_output.contiguous().view(bsz, seq_len, -1)
         return self.o_proj(attn_output)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if self._attn_impl == "fa2":
-            return self._forward_fa2(x)
-        return self._forward_sdpa(x)
+            return self._forward_fa2(x, attn_bias=attn_bias)
+        return self._forward_sdpa(x, attn_bias=attn_bias)
 
 
 class SwiGLUFFN(nn.Module):
@@ -271,8 +372,10 @@ class TransformerBlock(nn.Module):
             self.mlp_res_query = nn.Parameter(torch.zeros(config.hidden_size))
             self.mlp_res_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x))
+    def forward(
+        self, x: torch.Tensor, attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x), attn_bias=attn_bias)
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
@@ -281,10 +384,10 @@ class TransformerBlock(nn.Module):
 
 
 class ChessTransformer(nn.Module):
-    """Chess transformer with dual policy/value heads.
+    """Chess transformer with policy, WDL value, and auxiliary heads.
 
     Input: board token tensor from BoardEncoder (shape B x 67).
-    Output: policy logits (B x 4672), value (B x 1).
+    Output: (policy_logits, wdl_logits, material_pred, activity_pred).
     """
 
     def __init__(self, config: ChessModelConfig) -> None:
@@ -293,10 +396,12 @@ class ChessTransformer(nn.Module):
 
         # ── Chess-specific embeddings ──────────────────────────────────
         self.piece_embed = nn.Embedding(config.num_piece_types, config.hidden_size)
-        self.pos_embed = nn.Embedding(config.seq_len, config.hidden_size)
         self.castling_embed = nn.Embedding(config.num_castling_states, config.hidden_size)
         self.ep_embed = nn.Embedding(config.num_ep_states, config.hidden_size)
         self.side_embed = nn.Embedding(config.num_sides, config.hidden_size)
+
+        # ── Relative position bias (replaces learned pos_embed) ────────
+        self.rel_pos_bias = RelativePositionBias(config)
 
         # ── Transformer backbone ───────────────────────────────────────
         self.layers = nn.ModuleList(
@@ -307,9 +412,16 @@ class ChessTransformer(nn.Module):
         # ── Policy head: per-square projection to 73 move types ────────
         self.policy_head = nn.Linear(config.hidden_size, config.policy_moves_per_square)
 
-        # ── Value head: pool → hidden → tanh ───────────────────────────
+        # ── WDL value head: pool → hidden → 3-class (loss/draw/win) ────
         self.value_fc1 = nn.Linear(config.hidden_size, config.value_hidden_size)
-        self.value_fc2 = nn.Linear(config.value_hidden_size, 1)
+        self.value_fc2 = nn.Linear(config.value_hidden_size, 3)
+
+        # ── Auxiliary heads ────────────────────────────────────────────
+        aux_hidden = 128
+        self.material_fc1 = nn.Linear(config.hidden_size, aux_hidden)
+        self.material_fc2 = nn.Linear(aux_hidden, 1)
+        self.activity_fc1 = nn.Linear(config.hidden_size, aux_hidden)
+        self.activity_fc2 = nn.Linear(aux_hidden, 1)
 
         # ── Block Attention Residuals ──────────────────────────────────
         if config.attn_res:
@@ -363,9 +475,28 @@ class ChessTransformer(nn.Module):
         nn.init.normal_(self.policy_head.weight, mean=0.0, std=0.005)
         nn.init.zeros_(self.policy_head.bias)
 
-        # Value head: zero-init final layer → predict draws initially
+        # WDL value head: zero-init final layer → uniform [1/3, 1/3, 1/3]
         nn.init.zeros_(self.value_fc2.weight)
         nn.init.zeros_(self.value_fc2.bias)
+
+        # Auxiliary heads: zero-init final layers → predict 0 initially
+        nn.init.zeros_(self.material_fc2.weight)
+        nn.init.zeros_(self.material_fc2.bias)
+        nn.init.zeros_(self.activity_fc2.weight)
+        nn.init.zeros_(self.activity_fc2.bias)
+
+    # ── AttnRes helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _ckpt_sublayer(
+        norm: nn.Module, fn: nn.Module, x: torch.Tensor,
+        attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Checkpoint-friendly helper: norm → sublayer (attention or FFN)."""
+        normed = norm(x)
+        if attn_bias is not None:
+            return fn(normed, attn_bias=attn_bias)
+        return fn(normed)
 
     # ── AttnRes routing (from luxia-base) ──────────────────────────────
 
@@ -396,14 +527,22 @@ class ChessTransformer(nn.Module):
 
         return (weights.unsqueeze(-1) * buf).sum(0)  # (B, T, D)
 
-    def _forward_attn_res(self, embed: torch.Tensor) -> torch.Tensor:
-        """Forward with Block Attention Residuals (compile-friendly)."""
+    def _forward_attn_res(
+        self, embed: torch.Tensor, attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Forward with Block Attention Residuals.
+
+        Supports activation checkpointing: wraps each layer's attention and FFN
+        in torch.utils.checkpoint to trade compute for memory. Routing is kept
+        outside the checkpoint boundary since its intermediates are smaller.
+        """
         committed: list[torch.Tensor] = []
         partial = embed
         boundary_set = self._attn_res_boundary_set
         max_s = self._attn_res_max_sources
         masks = self._attn_res_masks
         zero = torch.zeros_like(embed)
+        do_ckpt = self.config.activation_checkpointing and self.training
 
         def _pad_and_stack(
             committed: list[torch.Tensor], partial: torch.Tensor,
@@ -422,14 +561,26 @@ class ChessTransformer(nn.Module):
                 committed.append(partial.clone())
                 partial = zero.clone()
 
-            attn_out = layer.attn(layer.attn_norm(h))
+            if do_ckpt:
+                attn_out = torch_checkpoint(
+                    self._ckpt_sublayer, layer.attn_norm, layer.attn, h, attn_bias,
+                    use_reentrant=False, preserve_rng_state=False,
+                )
+            else:
+                attn_out = layer.attn(layer.attn_norm(h), attn_bias=attn_bias)
             partial = partial + attn_out
 
             # Pre-MLP routing
             buf = _pad_and_stack(committed, partial)
             h = self._route_static(buf, layer.mlp_res_query, layer.mlp_res_norm, masks[2 * i + 1])
 
-            mlp_out = layer.ffn(layer.ffn_norm(h))
+            if do_ckpt:
+                mlp_out = torch_checkpoint(
+                    self._ckpt_sublayer, layer.ffn_norm, layer.ffn, h,
+                    use_reentrant=False, preserve_rng_state=False,
+                )
+            else:
+                mlp_out = layer.ffn(layer.ffn_norm(h))
             partial = partial + mlp_out
 
         # Final aggregation
@@ -443,20 +594,21 @@ class ChessTransformer(nn.Module):
     # ── Forward passes ──────────────────────────────────────────────────
 
     def _embed(self, board_tokens: torch.Tensor) -> torch.Tensor:
-        """Embed board tokens into hidden representations. (B, 67) → (B, 67, D)."""
-        castling = self.castling_embed(board_tokens[:, 0])
-        ep = self.ep_embed(board_tokens[:, 1])
-        side = self.side_embed(board_tokens[:, 2])
-        pieces = self.piece_embed(board_tokens[:, 3:])
+        """Embed board tokens into hidden representations. (B, 67) → (B, 67, D).
 
-        pos_ids = torch.arange(self.config.seq_len, device=board_tokens.device)
-        pos = self.pos_embed(pos_ids)
+        Positional information is provided by relative position bias in attention,
+        not additive positional embeddings.
+        """
+        castling = self.castling_embed(board_tokens[:, 0])  # (B, D)
+        ep = self.ep_embed(board_tokens[:, 1])              # (B, D)
+        side = self.side_embed(board_tokens[:, 2])          # (B, D)
+        pieces = self.piece_embed(board_tokens[:, 3:])      # (B, 64, D)
 
         return torch.cat([
-            (castling + pos[0]).unsqueeze(1),
-            (ep + pos[1]).unsqueeze(1),
-            (side + pos[2]).unsqueeze(1),
-            pieces + pos[3:].unsqueeze(0),
+            castling.unsqueeze(1),
+            ep.unsqueeze(1),
+            side.unsqueeze(1),
+            pieces,
         ], dim=1)
 
     def backbone_forward(self, board_tokens: torch.Tensor) -> torch.Tensor:
@@ -471,19 +623,20 @@ class ChessTransformer(nn.Module):
             hidden_states: (B, 67, D) normalized hidden representations.
         """
         x = self._embed(board_tokens)
+        attn_bias = self.rel_pos_bias()
 
         if self.config.attn_res:
-            x = self._forward_attn_res(x)
+            x = self._forward_attn_res(x, attn_bias=attn_bias)
         else:
             for layer in self.layers:
                 if self.config.activation_checkpointing and self.training:
                     x = torch_checkpoint(
-                        layer, x,
+                        layer, x, attn_bias,
                         use_reentrant=False,
                         preserve_rng_state=False,
                     )
                 else:
-                    x = layer(x)
+                    x = layer(x, attn_bias=attn_bias)
             x = self.norm(x)
 
         return x
@@ -491,7 +644,7 @@ class ChessTransformer(nn.Module):
     def forward(
         self,
         board_tokens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Args:
@@ -499,7 +652,9 @@ class ChessTransformer(nn.Module):
 
         Returns:
             policy_logits: (B, 4672) raw logits over all possible moves.
-            value: (B, 1) tanh-squashed value in [-1, 1].
+            wdl_logits: (B, 3) win/draw/loss logits.
+            material_pred: (B, 1) predicted material balance (normalized).
+            activity_pred: (B, 1) predicted legal move count (normalized).
         """
         B = board_tokens.shape[0]
         x = self.backbone_forward(board_tokens)
@@ -509,31 +664,48 @@ class ChessTransformer(nn.Module):
         policy_logits = self.policy_head(square_features)           # (B, 64, 73)
         policy_logits = policy_logits.reshape(B, -1)                # (B, 4672)
 
-        # Value head: pool all tokens
+        # Pool all tokens for value + aux heads
         pooled = x.mean(dim=1)                                      # (B, D)
-        value = torch.tanh(self.value_fc2(F.relu(self.value_fc1(pooled))))  # (B, 1)
 
-        return policy_logits, value
+        # WDL value head
+        wdl_logits = self.value_fc2(F.relu(self.value_fc1(pooled))) # (B, 3)
+
+        # Auxiliary heads
+        material_pred = self.material_fc2(F.relu(self.material_fc1(pooled)))  # (B, 1)
+        activity_pred = self.activity_fc2(F.relu(self.activity_fc1(pooled)))  # (B, 1)
+
+        return policy_logits, wdl_logits, material_pred, activity_pred
 
     # ── NCA transition helpers ─────────────────────────────────────────
 
     def reinit_embeddings_for_chess(self) -> None:
-        """Reinitialize embeddings for chess after NCA pre-training.
+        """Reinitialize embeddings and heads for chess after NCA pre-training.
 
         Keeps attention and FFN weights (which learned grid dynamics from NCA).
-        Only resets the input embeddings and output heads.
+        Resets input embeddings, output heads, and auxiliary heads.
         """
         std = 0.02
         for embed in [
-            self.piece_embed, self.pos_embed,
+            self.piece_embed,
             self.castling_embed, self.ep_embed, self.side_embed,
         ]:
             nn.init.normal_(embed.weight, mean=0.0, std=std)
+
+        # Reinit relative position bias (small init for gradual integration)
+        for param in self.rel_pos_bias.parameters():
+            if param.dim() >= 2:
+                nn.init.normal_(param, mean=0.0, std=0.01)
+            else:
+                nn.init.zeros_(param)
 
         nn.init.normal_(self.policy_head.weight, mean=0.0, std=0.005)
         nn.init.zeros_(self.policy_head.bias)
         nn.init.zeros_(self.value_fc2.weight)
         nn.init.zeros_(self.value_fc2.bias)
+        nn.init.zeros_(self.material_fc2.weight)
+        nn.init.zeros_(self.material_fc2.bias)
+        nn.init.zeros_(self.activity_fc2.weight)
+        nn.init.zeros_(self.activity_fc2.bias)
 
     def reinit_mlps(self) -> None:
         """Reinitialize all MLP weights (optional, after NCA pre-training)."""

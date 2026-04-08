@@ -19,9 +19,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
 import signal
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -45,6 +47,7 @@ logger = logging.getLogger(__name__)
 # ── Graceful shutdown ──────────────────────────────────────────────────────
 
 _shutdown_requested = False
+_shutdown_event = threading.Event()
 
 
 def _request_shutdown(signum: int, frame: object) -> None:
@@ -54,8 +57,9 @@ def _request_shutdown(signum: int, frame: object) -> None:
         logger.warning("Second signal received — forcing exit")
         raise SystemExit(1)
     _shutdown_requested = True
+    _shutdown_event.set()
     logger.info(
-        "Shutdown requested (signal %d) — will checkpoint after current step",
+        "Shutdown requested (signal %d) — saving checkpoint and exiting",
         signum,
     )
 
@@ -109,7 +113,17 @@ def run_nca_bootstrap(
     if nca_ckpt_path.exists():
         logger.info("Found final NCA checkpoint at %s — skipping NCA phase", nca_ckpt_path)
         ckpt = torch.load(nca_ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"], strict=False)
+        # Filter out keys with shape mismatches (e.g. old scalar value_fc2 vs new WDL)
+        ckpt_state = ckpt["model"]
+        model_state = model.state_dict()
+        filtered = {
+            k: v for k, v in ckpt_state.items()
+            if k in model_state and v.shape == model_state[k].shape
+        }
+        skipped = set(ckpt_state.keys()) - set(filtered.keys())
+        if skipped:
+            logger.info("Skipped %d keys with shape mismatch: %s", len(skipped), list(skipped)[:10])
+        model.load_state_dict(filtered, strict=False)
         logger.info("Loaded NCA weights (step %d, loss %.4f)", ckpt.get("step", -1), ckpt.get("loss", -1))
         if not skip_reinit:
             model.reinit_embeddings_for_chess()
@@ -459,41 +473,67 @@ def is_main_process() -> bool:
 
 def compute_loss(
     policy_logits: torch.Tensor,
-    value_pred: torch.Tensor,
+    wdl_logits: torch.Tensor,
+    material_pred: torch.Tensor,
+    activity_pred: torch.Tensor,
     target_policy: torch.Tensor,
     target_value: torch.Tensor,
+    target_material: torch.Tensor,
+    target_activity: torch.Tensor,
     z_loss_weight: float = 1e-5,
+    material_loss_weight: float = 0.1,
+    activity_loss_weight: float = 0.05,
 ) -> dict[str, torch.Tensor]:
-    """Compute AlphaZero-style training loss.
+    """Compute training loss with WDL value head and auxiliary targets.
 
     Args:
         policy_logits: (B, 4672) raw policy logits from model.
-        value_pred: (B, 1) tanh-squashed value predictions.
+        wdl_logits: (B, 3) win/draw/loss logits from model.
+        material_pred: (B, 1) predicted material balance.
+        activity_pred: (B, 1) predicted legal move count.
         target_policy: (B, 4672) MCTS visit count distributions (sums to 1).
-        target_value: (B,) game outcomes from side-to-move perspective.
+        target_value: (B,) game outcomes {-1, 0, +1} from side-to-move perspective.
+        target_material: (B,) normalized material balance.
+        target_activity: (B,) normalized legal move count.
         z_loss_weight: z-loss coefficient for policy logit regularization.
+        material_loss_weight: weight for material prediction auxiliary loss.
+        activity_loss_weight: weight for activity prediction auxiliary loss.
 
     Returns:
-        Dict with 'loss', 'policy_loss', 'value_loss', 'z_loss' tensors.
+        Dict with 'loss', 'policy_loss', 'value_loss', 'z_loss',
+        'material_loss', 'activity_loss' tensors.
     """
     # Policy loss: cross-entropy between MCTS policy and model policy
     log_probs = F.log_softmax(policy_logits, dim=-1)
     policy_loss = -(target_policy * log_probs).sum(dim=-1).mean()
 
-    # Value loss: MSE between predicted and actual outcome
-    value_loss = F.mse_loss(value_pred.squeeze(-1), target_value)
+    # WDL value loss: cross-entropy with 3 classes {0=loss, 1=draw, 2=win}
+    target_class = (target_value + 1).long()  # {-1,0,+1} → {0,1,2}
+    value_loss = F.cross_entropy(wdl_logits, target_class)
 
     # z-loss: prevent policy logit explosion (from luxia-base)
     log_z = torch.logsumexp(policy_logits, dim=-1)
     z_loss = z_loss_weight * (log_z ** 2).mean()
 
-    total_loss = policy_loss + value_loss + z_loss
+    # Auxiliary losses
+    material_loss = F.mse_loss(material_pred.squeeze(-1), target_material)
+    activity_loss = F.mse_loss(activity_pred.squeeze(-1), target_activity)
+
+    total_loss = (
+        policy_loss
+        + value_loss
+        + z_loss
+        + material_loss_weight * material_loss
+        + activity_loss_weight * activity_loss
+    )
 
     return {
         "loss": total_loss,
         "policy_loss": policy_loss,
         "value_loss": value_loss,
         "z_loss": z_loss,
+        "material_loss": material_loss,
+        "activity_loss": activity_loss,
     }
 
 
@@ -540,6 +580,9 @@ def train(args: argparse.Namespace) -> None:
 
     # Enable TF32 for matmuls
     torch.backends.cuda.matmul.allow_tf32 = True
+
+    # torch.compile is applied after checkpoint loading (below) to avoid
+    # _orig_mod. key prefix mismatch when loading non-compiled checkpoints.
     torch.backends.cudnn.allow_tf32 = True
 
     # ── Checkpoint dir (needed by NCA bootstrap) ──────────────────────
@@ -624,21 +667,27 @@ def train(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         mcts_simulations=args.mcts_simulations,
         temperature_threshold=args.temperature_threshold,
+        dirichlet_epsilon=args.dirichlet_epsilon,
         num_virtual_leaves=args.num_virtual_leaves,
+        mcts_algorithm=args.mcts_algorithm,
+        gumbel_K=args.gumbel_K,
+        gumbel_c_visit=args.gumbel_c_visit,
     )
 
-    # Use multiprocessing when >1 worker, fallback to single-process
+    # Use multiprocessing when >1 worker, fallback to single-process.
+    # Pass `model` (not raw_model) so torch.compile benefits apply to inference.
+    # raw_model is kept for checkpoint saving (clean state_dict keys).
     if args.num_workers > 1:
         self_play_engine: ParallelSelfPlay | SelfPlayWorker = ParallelSelfPlay(
-            model=raw_model, config=self_play_config, device=device,
+            model=model, config=self_play_config, device=device,
         )
     else:
         self_play_engine = SelfPlayWorker(
-            model=raw_model, config=self_play_config, device=device,
+            model=model, config=self_play_config, device=device,
         )
 
     # ── Replay buffer ─────────────────────────────────────────────────
-    replay_buffer = ReplayBuffer(capacity=args.buffer_size)
+    replay_buffer = ReplayBuffer(capacity=args.buffer_size, decisive_boost=args.decisive_boost)
 
     # ── Evaluation ────────────────────────────────────────────────────
     evaluator: Optional[StockfishEvaluator] = None
@@ -669,27 +718,71 @@ def train(args: argparse.Namespace) -> None:
     if latest_ckpt.exists() and args.resume:
         if is_main_process():
             logger.info("Resuming from %s", latest_ckpt)
-        ckpt = torch.load(latest_ckpt, map_location=device, weights_only=False)
-        raw_model.load_state_dict(ckpt["model"])
+        ckpt = torch.load(latest_ckpt, map_location="cpu", weights_only=False)
+        # Filter shape mismatches for cross-version checkpoint compatibility
+        ckpt_state = ckpt["model"]
+        model_state = raw_model.state_dict()
+        filtered = {
+            k: v for k, v in ckpt_state.items()
+            if k in model_state and v.shape == model_state[k].shape
+        }
+        shape_skipped = set(ckpt_state.keys()) - set(filtered.keys())
+        if shape_skipped:
+            logger.warning("Skipped %d keys with shape mismatch: %s", len(shape_skipped), list(shape_skipped)[:10])
+        missing, unexpected = raw_model.load_state_dict(filtered, strict=False)
+        if missing:
+            logger.info("Missing keys on resume (new params, using init): %s", missing[:10])
+        if unexpected:
+            logger.warning("Unexpected keys on resume (removed params): %s", unexpected[:10])
         muon_opt.load_state_dict(ckpt["muon_opt"])
         adamw_opt.load_state_dict(ckpt["adamw_opt"])
         start_iteration = ckpt.get("iteration", 0)
+        if "replay_buffer" in ckpt:
+            replay_buffer.load_state_dict(ckpt["replay_buffer"])
+            logger.info("Restored replay buffer (%d positions)", len(replay_buffer))
         del ckpt
+
+    # ── torch.compile (after checkpoint load to avoid key prefix mismatch) ──
+    if args.compile:
+        if is_main_process():
+            logger.info("Compiling model with torch.compile...")
+        model = torch.compile(model)
+        raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+        # Update self-play and eval to use compiled model for inference
+        self_play_engine.model = model
+        if is_main_process():
+            logger.info("Compilation registered (will compile on first forward)")
 
     # ── Main training loop ────────────────────────────────────────────
     global_train_step = start_iteration * args.train_steps_per_iter
 
     for iteration in range(start_iteration, args.num_iterations):
         iter_start = time.time()
+        iter_log_dict: dict[str, float] = {}
 
         # ── Self-play phase ───────────────────────────────────────
         if is_main_process():
             logger.info("Iteration %d: generating %d games...", iteration, args.games_per_iter)
 
+        # Check for shutdown before starting expensive self-play
+        if _shutdown_requested:
+            break
+
         selfplay_start = time.time()
         raw_model.eval()
-        games = self_play_engine.generate_games(args.games_per_iter)
+        games = self_play_engine.generate_games(
+            args.games_per_iter, shutdown_event=_shutdown_event,
+        )
         selfplay_time = time.time() - selfplay_start
+
+        # If shutdown was requested during self-play, skip to checkpoint
+        if _shutdown_requested:
+            logger.info("Self-play interrupted — skipping to checkpoint")
+            break
+
+        # Light GC between phases (skip empty_cache — costs ~200ms, unnecessary
+        # on dedicated GPU; only helps when VRAM is tight from co-location)
+        gc.collect()
 
         total_positions = sum(len(g) for g in games)
         game_lengths = [len(g) for g in games]
@@ -716,7 +809,7 @@ def train(args: argparse.Namespace) -> None:
 
         # Set probe batch for monitoring (once, from first generation)
         if monitor is not None and monitor._probe_batch is None and len(replay_buffer) >= 64:
-            probe_boards, _, _ = replay_buffer.sample(64)
+            probe_boards, *_ = replay_buffer.sample(64)
             monitor.set_probe_batch(probe_boards)
 
         # ── Training phase ────────────────────────────────────────
@@ -728,21 +821,39 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         train_metrics: dict[str, float] = {
             "loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "z_loss": 0.0,
+            "material_loss": 0.0, "activity_loss": 0.0,
         }
         grad_norm_sum = 0.0
         train_start = time.time()
 
-        for step in range(args.train_steps_per_iter):
-            boards, target_policies, target_values = replay_buffer.sample(args.batch_size)
+        # Scale training steps proportionally to buffer size so we maintain
+        # roughly consistent passes through the data as the buffer grows.
+        # At minimum do the base steps, scale up to 2x as buffer fills.
+        if args.train_steps_scale_with_buffer:
+            base_buffer = args.games_per_iter * 200  # ~1 iteration of data
+            buffer_ratio = len(replay_buffer) / max(base_buffer, 1)
+            num_train_steps = min(
+                int(args.train_steps_per_iter * max(1.0, buffer_ratio)),
+                args.train_steps_per_iter * 3,  # cap at 3x
+            )
+        else:
+            num_train_steps = args.train_steps_per_iter
+
+        for step in range(num_train_steps):
+            boards, target_policies, target_values, target_materials, target_activities = (
+                replay_buffer.sample(args.batch_size)
+            )
             boards = boards.to(device)
             target_policies = target_policies.to(device)
             target_values = target_values.to(device)
+            target_materials = target_materials.to(device)
+            target_activities = target_activities.to(device)
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                policy_logits, value_pred = model(boards)
+                policy_logits, wdl_logits, material_pred, activity_pred = model(boards)
                 losses = compute_loss(
-                    policy_logits, value_pred,
-                    target_policies, target_values,
+                    policy_logits, wdl_logits, material_pred, activity_pred,
+                    target_policies, target_values, target_materials, target_activities,
                     z_loss_weight=config.z_loss_weight,
                 )
 
@@ -767,7 +878,7 @@ def train(args: argparse.Namespace) -> None:
             grad_norm_sum += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
 
         # Average metrics
-        num_steps = args.train_steps_per_iter
+        num_steps = num_train_steps
         for k in train_metrics:
             train_metrics[k] /= num_steps
         avg_grad_norm = grad_norm_sum / num_steps
@@ -779,13 +890,15 @@ def train(args: argparse.Namespace) -> None:
         if is_main_process():
             lrs = scheduler.get_last_lr()
             logger.info(
-                "Iter %d: loss=%.4f (policy=%.4f value=%.4f z=%.6f) "
+                "Iter %d: loss=%.4f (policy=%.4f value=%.4f z=%.6f mat=%.4f act=%.4f) "
                 "lr_muon=%.2e lr_adam=%.2e grad=%.2f time=%.1fs",
                 iteration,
                 train_metrics["loss"],
                 train_metrics["policy_loss"],
                 train_metrics["value_loss"],
                 train_metrics["z_loss"],
+                train_metrics["material_loss"],
+                train_metrics["activity_loss"],
                 lrs["muon_lr"],
                 lrs["adamw_lr"],
                 grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
@@ -816,27 +929,28 @@ def train(args: argparse.Namespace) -> None:
                     "selfplay/positions_per_sec": total_positions / max(selfplay_time, 1e-6),
                     # Training throughput
                     "train/steps_per_sec": num_steps / max(train_time, 1e-6),
+                    "train/num_steps": num_steps,
                 })
-                wandb_run.log(log_dict, step=iteration)
+                # Don't log yet — accumulate all metrics for this iteration
+                iter_log_dict = log_dict
 
         # ── Geometric monitoring ──────────────────────────────────
         if monitor is not None and is_main_process():
             if global_train_step % args.monitor_tier1_every == 0:
                 raw_model.eval()
-                # Get policy logits for policy entropy metric
                 probe = monitor._probe_batch
                 if probe is not None:
                     with torch.no_grad():
-                        p_logits, _ = raw_model(probe.to(device))
+                        p_logits, _, _, _ = raw_model(probe.to(device))
                     geo_metrics = monitor.tier1(global_train_step, policy_logits=p_logits)
                     if wandb_run is not None:
-                        wandb_run.log(geo_metrics, step=iteration)
+                        iter_log_dict.update(geo_metrics)
 
             if global_train_step % args.monitor_tier2_every == 0:
                 raw_model.eval()
                 geo_metrics = monitor.tier2(global_train_step)
                 if wandb_run is not None:
-                    wandb_run.log(geo_metrics, step=iteration)
+                    iter_log_dict.update(geo_metrics)
 
         # ── Evaluation ────────────────────────────────────────────
         if (
@@ -847,25 +961,41 @@ def train(args: argparse.Namespace) -> None:
             if is_main_process():
                 logger.info("Running Stockfish evaluation...")
                 raw_model.eval()
-                eval_results = evaluator.evaluate(raw_model)
+                eval_results = evaluator.evaluate(
+                    raw_model, early_stop=lambda: _shutdown_requested,
+                )
 
                 if wandb_run is not None:
-                    wandb_run.log(eval_results, step=iteration)
+                    iter_log_dict.update(eval_results)
+
+        # ── Flush all metrics for this iteration to wandb ─────────
+        if wandb_run is not None and is_main_process():
+            if iter_log_dict:
+                wandb_run.log(iter_log_dict, commit=True)
+                logger.debug("Logged %d metrics to wandb (iter %d)", len(iter_log_dict), iteration)
 
         # ── Checkpoint ────────────────────────────────────────────
         _should_ckpt = is_main_process() and (
-            (args.save_every > 0 and (iteration + 1) % args.save_every == 0)
+            iteration == start_iteration  # always save first completed iteration
+            or (args.save_every > 0 and (iteration + 1) % args.save_every == 0)
             or _shutdown_requested
         )
         if _should_ckpt:
             ckpt_path = ckpt_dir / f"iter_{iteration:06d}.pt"
-            torch.save({
+            ckpt_data: dict = {
                 "model": raw_model.state_dict(),
                 "muon_opt": muon_opt.state_dict(),
                 "adamw_opt": adamw_opt.state_dict(),
                 "iteration": iteration + 1,
                 "config": vars(config) if hasattr(config, '__dict__') else str(config),
-            }, ckpt_path)
+            }
+            if len(replay_buffer) > 0:
+                ckpt_data["replay_buffer"] = replay_buffer.state_dict()
+                logger.info(
+                    "Including replay buffer in checkpoint (%d positions)",
+                    len(replay_buffer),
+                )
+            torch.save(ckpt_data, ckpt_path)
             # Symlink latest
             if latest_ckpt.exists() or latest_ckpt.is_symlink():
                 latest_ckpt.unlink()
@@ -875,6 +1005,26 @@ def train(args: argparse.Namespace) -> None:
         if _shutdown_requested:
             logger.info("Graceful shutdown at iteration %d", iteration)
             break
+
+    # ── Shutdown checkpoint (save latest weights if interrupted) ────────
+    if _shutdown_requested and is_main_process():
+        ckpt_path = ckpt_dir / f"iter_{iteration:06d}.pt"
+        # Always save shutdown checkpoint (overwrite stale files from previous runs)
+        logger.info("Saving shutdown checkpoint at iteration %d...", iteration)
+        ckpt_data = {
+            "model": raw_model.state_dict(),
+            "muon_opt": muon_opt.state_dict(),
+            "adamw_opt": adamw_opt.state_dict(),
+            "iteration": iteration,
+            "config": vars(config) if hasattr(config, '__dict__') else str(config),
+        }
+        if len(replay_buffer) > 0:
+            ckpt_data["replay_buffer"] = replay_buffer.state_dict()
+        torch.save(ckpt_data, ckpt_path)
+        if latest_ckpt.exists() or latest_ckpt.is_symlink():
+            latest_ckpt.unlink()
+        latest_ckpt.symlink_to(ckpt_path.name)
+        logger.info("Shutdown checkpoint saved: %s", ckpt_path)
 
     # ── Cleanup ───────────────────────────────────────────────────────
     if evaluator is not None:
@@ -904,9 +1054,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_iterations", type=int, default=1000)
     parser.add_argument("--games_per_iter", type=int, default=256)
     parser.add_argument("--train_steps_per_iter", type=int, default=1000)
+    parser.add_argument("--train_steps_scale_with_buffer", action="store_true",
+                        help="Scale training steps proportionally to buffer size")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--gradient_clip", type=float, default=1.0)
     parser.add_argument("--buffer_size", type=int, default=1_000_000)
+    parser.add_argument("--decisive_boost", type=float, default=1.0,
+                        help="PER sampling weight for decisive positions (1.0=uniform, 4.0=recommended)")
 
     # Optimizer
     parser.add_argument("--muon_lr", type=float, default=0.02)
@@ -923,6 +1077,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_virtual_leaves", type=int, default=4,
                         help="Parallel leaves per game via virtual loss")
     parser.add_argument("--temperature_threshold", type=int, default=30)
+    parser.add_argument("--dirichlet_epsilon", type=float, default=0.25,
+                        help="Exploration noise strength at root (0.25=standard, higher=more diverse)")
+    parser.add_argument("--mcts_algorithm", type=str, default="alphazero",
+                        choices=["alphazero", "gumbel"],
+                        help="MCTS algorithm: alphazero (PUCT) or gumbel (Sequential Halving)")
+    parser.add_argument("--gumbel_K", type=int, default=16,
+                        help="Gumbel: number of candidate actions at root")
+    parser.add_argument("--gumbel_c_visit", type=float, default=50.0,
+                        help="Gumbel: sigma scaling for completed Q-values")
 
     # Evaluation
     parser.add_argument("--eval_every", type=int, default=10,
@@ -936,6 +1099,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile for fused kernels (adds ~30s startup)")
 
     # NCA Bootstrap
     parser.add_argument("--nca_bootstrap", action="store_true",

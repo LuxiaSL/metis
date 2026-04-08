@@ -257,8 +257,9 @@ class GeometricMonitor:
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
             x = self._embed_board(batch)
+            attn_bias = self.model.rel_pos_bias() if hasattr(self.model, 'rel_pos_bias') else None
             for i, layer in enumerate(self.model.layers):
-                x = layer(x)
+                x = layer(x, attn_bias=attn_bias)
                 all_hidden[i] = x.detach()
                 attn_w = self._get_attention_weights(layer, layer.attn_norm(x))
                 if attn_w is not None:
@@ -335,9 +336,10 @@ class GeometricMonitor:
             else:
                 # Replicate chess embedding from ChessTransformer.forward()
                 x = self._embed_board(board_tokens)
+                attn_bias = self.model.rel_pos_bias() if hasattr(self.model, 'rel_pos_bias') else None
 
                 for i, layer in enumerate(self.model.layers):
-                    x = layer(x)
+                    x = layer(x, attn_bias=attn_bias)
                     if i in needed:
                         hidden_states[i] = x.detach()
                         if i in self.config.tier1_sample_layers:
@@ -361,6 +363,7 @@ class GeometricMonitor:
         model = self.model
 
         embed = self._embed_board(board_tokens)
+        attn_bias = model.rel_pos_bias() if hasattr(model, 'rel_pos_bias') else None
         committed: list[torch.Tensor] = []
         partial = embed
         boundary_set = model._attn_res_boundary_set
@@ -389,7 +392,7 @@ class GeometricMonitor:
                     if attn_w is not None:
                         attn_weights[i] = attn_w
 
-            attn_out = layer.attn(layer.attn_norm(h))
+            attn_out = layer.attn(layer.attn_norm(h), attn_bias=attn_bias)
             partial = partial + attn_out
 
             buf = _pad_and_stack(committed, partial)
@@ -427,21 +430,18 @@ class GeometricMonitor:
         return hidden_states, attn_weights
 
     def _embed_board(self, board_tokens: torch.Tensor) -> torch.Tensor:
-        """Replicate chess-specific embedding from ChessTransformer.forward()."""
+        """Replicate chess-specific embedding from ChessTransformer._embed()."""
         model = self.model
         castling = model.castling_embed(board_tokens[:, 0])
         ep = model.ep_embed(board_tokens[:, 1])
         side = model.side_embed(board_tokens[:, 2])
         pieces = model.piece_embed(board_tokens[:, 3:])
 
-        pos_ids = torch.arange(model.config.seq_len, device=board_tokens.device)
-        pos = model.pos_embed(pos_ids)
-
         return torch.cat([
-            (castling + pos[0]).unsqueeze(1),
-            (ep + pos[1]).unsqueeze(1),
-            (side + pos[2]).unsqueeze(1),
-            pieces + pos[3:].unsqueeze(0),
+            castling.unsqueeze(1),
+            ep.unsqueeze(1),
+            side.unsqueeze(1),
+            pieces,
         ], dim=1)
 
     def _get_attention_weights(

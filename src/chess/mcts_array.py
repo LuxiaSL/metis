@@ -16,8 +16,9 @@ import numba
 import numpy as np
 
 from src.chess.board import MoveEncoder
+from src.chess.bitboard import Board as BitboardBoard
 
-DEFAULT_CAPACITY = 300_000
+DEFAULT_CAPACITY = 20_000_000
 _MAX_DEPTH = 256
 
 
@@ -209,15 +210,29 @@ class MCTSTree:
         moves: list[tuple[int, int, int, float]] = []
         total_prior = 0.0
 
-        for move in board.legal_moves:
-            try:
-                idx = MoveEncoder.move_to_index(move)
-                p = float(policy[idx])
-                promo = move.promotion if move.promotion is not None else 0
-                moves.append((move.from_square, move.to_square, promo, p))
-                total_prior += p
-            except ValueError:
-                continue
+        if isinstance(board, BitboardBoard):
+            for move_code in board.legal_move_codes():
+                move = int(move_code)
+                from_sq = move & 63
+                to_sq = (move >> 6) & 63
+                promo = (move >> 12) & 7
+                try:
+                    idx = MoveEncoder.move_components_to_index(from_sq, to_sq, promo)
+                    p = float(policy[idx])
+                    moves.append((from_sq, to_sq, promo, p))
+                    total_prior += p
+                except ValueError:
+                    continue
+        else:
+            for move in board.legal_moves:
+                try:
+                    idx = MoveEncoder.move_to_index(move)
+                    p = float(policy[idx])
+                    promo = move.promotion if move.promotion is not None else 0
+                    moves.append((move.from_square, move.to_square, promo, p))
+                    total_prior += p
+                except ValueError:
+                    continue
 
         if not moves:
             self.is_terminal[node_idx] = True
@@ -280,13 +295,21 @@ class MCTSTree:
         leaf = int(path[-1]) if path_len > 0 else self.root
 
         search_board = board.copy(stack=False)
-        for i in range(path_len):
-            node = int(path[i])
-            from_sq = int(self.move_from_sq[node])
-            to_sq = int(self.move_to_sq[node])
-            promo = int(self.move_promo[node])
-            move = chess.Move(from_sq, to_sq, promotion=promo if promo else None)
-            search_board.push(move)
+        if isinstance(search_board, BitboardBoard):
+            for i in range(path_len):
+                node = int(path[i])
+                from_sq = int(self.move_from_sq[node])
+                to_sq = int(self.move_to_sq[node])
+                promo = int(self.move_promo[node])
+                search_board.push(from_sq | (to_sq << 6) | (promo << 12))
+        else:
+            for i in range(path_len):
+                node = int(path[i])
+                from_sq = int(self.move_from_sq[node])
+                to_sq = int(self.move_to_sq[node])
+                promo = int(self.move_promo[node])
+                move = chess.Move(from_sq, to_sq, promotion=promo if promo else None)
+                search_board.push(move)
 
         return leaf, search_board, path
 
@@ -301,7 +324,38 @@ class MCTSTree:
                 node, self.children_start, self.num_children,
                 self.visit_count, self.value_sum, self.prior, cpuct,
             ))
-            search_board.push(self.get_child_move(child))
+            if isinstance(search_board, BitboardBoard):
+                from_sq = int(self.move_from_sq[child])
+                to_sq = int(self.move_to_sq[child])
+                promo = int(self.move_promo[child])
+                search_board.push(from_sq | (to_sq << 6) | (promo << 12))
+            else:
+                search_board.push(self.get_child_move(child))
+            node = child
+        return node, search_board
+
+    def find_leaf_in_subtree(
+        self, child_idx: int, board: chess.Board, cpuct: float,
+    ) -> tuple[int, chess.Board]:
+        """Find a leaf starting from a specific child of root (no virtual loss).
+
+        Used by Sequential Halving to direct simulations into an action's subtree.
+        The board should already have the root→child move applied.
+        """
+        node = child_idx
+        search_board = board.copy(stack=False)
+        while self.is_expanded[node] and not self.is_terminal[node]:
+            child = int(_select_child_jit(
+                node, self.children_start, self.num_children,
+                self.visit_count, self.value_sum, self.prior, cpuct,
+            ))
+            if isinstance(search_board, BitboardBoard):
+                from_sq = int(self.move_from_sq[child])
+                to_sq = int(self.move_to_sq[child])
+                promo = int(self.move_promo[child])
+                search_board.push(from_sq | (to_sq << 6) | (promo << 12))
+            else:
+                search_board.push(self.get_child_move(child))
             node = child
         return node, search_board
 
@@ -333,6 +387,57 @@ class MCTSTree:
             child = start + i
             result[self.get_child_move(child)] = int(self.visit_count[child])
         return result
+
+    def get_child_q_values(self, negate: bool = False) -> dict[chess.Move, float]:
+        """Q-values for all visited root children.
+
+        By default returns raw Q (value_sum/visits), which is from the CHILD's
+        STM perspective (opponent of root). The backup convention stores:
+          child.value_sum += value_from_leaf_stm (with sign flips per level)
+        resulting in child Q = from child's own STM = opponent of root.
+
+        Args:
+            negate: If True, return Q from ROOT's perspective (negated).
+                    Use negate=True for Gumbel improved policy.
+        """
+        nc = self.num_children[self.root]
+        if nc == 0:
+            return {}
+        start = self.children_start[self.root]
+        sign = -1.0 if negate else 1.0
+        result: dict[chess.Move, float] = {}
+        for i in range(nc):
+            child = start + i
+            visits = self.visit_count[child]
+            if visits > 0:
+                result[self.get_child_move(child)] = sign * float(self.value_sum[child]) / visits
+        return result
+
+    def get_completed_q_values(
+        self, root_value: float, legal_moves: list[chess.Move],
+    ) -> dict[chess.Move, float]:
+        """Completed Q-values from ROOT's perspective.
+
+        Visited children: negated backup Q (child stores opponent's perspective).
+        Unvisited children: root_value (already from root's STM perspective;
+        represents "this move is about as good as the current position").
+
+        Args:
+            root_value: V(root) from network, from root STM perspective.
+            legal_moves: All legal moves at root.
+
+        Returns:
+            Dict mapping every legal move to its completed Q-value from root's perspective.
+        """
+        q_visited = self.get_child_q_values(negate=True)  # From root's perspective
+        completed: dict[chess.Move, float] = {}
+        for move in legal_moves:
+            if move in q_visited:
+                completed[move] = q_visited[move]
+            else:
+                # Unvisited: baseline = root value (from root's perspective)
+                completed[move] = root_value
+        return completed
 
     def get_child_for_move(self, move: chess.Move) -> Optional[int]:
         nc = self.num_children[self.root]

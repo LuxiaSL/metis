@@ -1,0 +1,52 @@
+# Metis profiling config — isomorphic to v9, fewer games/steps.
+# Every computational parameter matches v9 exactly (workers, batch size,
+# MCTS sims, parallel games). Only volume is reduced so profiling
+# completes in minutes instead of hours.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=7 python scripts/profile_run.py \
+#       --config configs/selfplay_profile.yaml
+
+# ── Model (identical to v9) ───────────────────────────────────────
+model:
+  size: medium                    # 36M params, D=512, 12 layers
+  attn_res_boundaries: "0,1,3,9" # Block boundaries: [1, 2, 6, 3] layers
+  activation_checkpointing: false # Full B200: no need to trade compute for VRAM
+  compile: true                   # torch.compile (fused kernels, ~44% speedup)
+
+# ── Self-play (identical compute, fewer games) ────────────────────
+self_play:
+  num_workers: 96                 # Same worker count → same contention profile
+  num_parallel_games: 192         # Same batch density → same GPU batching
+  mcts_simulations: 800           # Same search depth → same per-game compute
+  games_per_iter: 96              # ← REDUCED: 96 vs 256 (must be >= num_workers for all 96 to be active)
+  max_moves: 200                  # Same game length distribution
+  num_virtual_leaves: 8           # Same leaf parallelism
+  temperature_threshold: 30       # Same exploration profile
+  dirichlet_epsilon: 0.25         # Same noise level
+
+# ── Training (identical compute per step, fewer steps) ────────────
+training:
+  batch_size: 1024                # Same batch size → same GPU memory profile
+  train_steps_per_iter: 50        # ← REDUCED: 50 vs 1000 (enough for steady-state)
+  gradient_clip: 1.0
+  buffer_size: 1000000
+
+# ── Disabled for profiling ────────────────────────────────────────
+eval:
+  eval_every: 0                   # No Stockfish eval (not profiling that)
+
+monitoring:
+  monitor: false                  # No geometric metrics (not profiling that)
+
+checkpoint:
+  save_every: 0                   # No checkpoints during profiling
+  checkpoint_dir: checkpoints/selfplay
+  resume: true                    # Load current checkpoint for realistic model
+
+nca:
+  nca_bootstrap: false            # Skip NCA (already done in production)
+
+infra:
+  stockfish_path: ~/luxi-files/bin/stockfish
+  wandb: false                    # No wandb logging

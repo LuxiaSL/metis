@@ -27,6 +27,21 @@ from src.chess.board import BoardEncoder, MoveEncoder, POLICY_SIZE
 from src.chess.mcts_array import MCTSTree
 
 
+def _extract_policy_and_value(outputs) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accept both legacy (policy, value) and current multi-head outputs."""
+    if not isinstance(outputs, tuple) or len(outputs) < 2:
+        raise ValueError("Model must return at least (policy, value_or_wdl)")
+
+    policy_logits = outputs[0]
+    value_head = outputs[1]
+    if value_head.shape[-1] == 3:
+        wdl_probs = torch.softmax(value_head.float(), dim=-1)
+        values = wdl_probs[..., 2] - wdl_probs[..., 0]
+    else:
+        values = value_head.squeeze(-1).float()
+    return policy_logits, values
+
+
 @dataclass
 class MCTSConfig:
     """MCTS hyperparameters."""
@@ -228,6 +243,194 @@ def select_move(
     return moves[np.random.choice(len(moves), p=probs)]
 
 
+# ── Gumbel AlphaZero ──────────────────────────────────────────────────────
+
+
+@dataclass
+class GumbelConfig:
+    """Gumbel AlphaZero hyperparameters."""
+
+    num_simulations: int = 200
+    max_K: int = 16
+    c_visit: float = 50.0
+    cpuct: float = 1.25
+    dirichlet_alpha: float = 0.3
+    dirichlet_epsilon: float = 0.0  # Disabled — Gumbel provides exploration
+
+
+def gumbel_top_k(
+    policy_logits: np.ndarray,
+    legal_move_indices: list[int],
+    K: int,
+) -> tuple[list[int], np.ndarray]:
+    """Sample K actions without replacement using the Gumbel-Top-K trick.
+
+    Args:
+        policy_logits: Raw logits from network (4672,).
+        legal_move_indices: Indices into policy_logits for legal moves.
+        K: Number of candidate actions to select.
+
+    Returns:
+        selected_indices: K indices into the policy_logits array (not into legal_move_indices).
+        gumbel_scores: The (log_pi + gumbel) scores for the selected actions.
+    """
+    log_pi = policy_logits[legal_move_indices].astype(np.float64)
+    log_pi = log_pi - np.max(log_pi)  # Numerical stability
+    gumbels = -np.log(-np.log(np.random.uniform(size=len(log_pi)) + 1e-20) + 1e-20)
+    scores = log_pi + gumbels
+
+    K = min(K, len(scores))
+    if K >= len(scores):
+        top_K_local = np.argsort(scores)[::-1]
+    else:
+        top_K_local = np.argpartition(scores, -K)[-K:]
+        top_K_local = top_K_local[np.argsort(scores[top_K_local])[::-1]]
+
+    selected = [legal_move_indices[i] for i in top_K_local]
+    return selected, scores[top_K_local]
+
+
+def compute_sigma(completed_q: dict[chess.Move, float], c_visit: float) -> float:
+    """Compute sigma for the improved policy from completed Q-value range.
+
+    sigma = c_visit * (max_Q - min_Q + epsilon)
+    """
+    if not completed_q:
+        return c_visit * 0.01
+    q_vals = list(completed_q.values())
+    q_range = max(q_vals) - min(q_vals)
+    return c_visit * (q_range + 0.01)
+
+
+def compute_improved_policy(
+    policy_logits: np.ndarray,
+    completed_q: dict[chess.Move, float],
+    legal_moves: list[chess.Move],
+    sigma: float,
+) -> np.ndarray:
+    """Compute improved policy: softmax(logits + sigma * Q_completed).
+
+    Args:
+        policy_logits: Raw network logits (4672,).
+        completed_q: Q-value for every legal move.
+        legal_moves: All legal moves at root.
+        sigma: Scaling for Q-values.
+
+    Returns:
+        (4672,) policy distribution.
+    """
+    policy = np.zeros(POLICY_SIZE, dtype=np.float32)
+    if not legal_moves:
+        return policy
+
+    indices = [MoveEncoder.move_to_index(m) for m in legal_moves]
+    logits = policy_logits[indices].astype(np.float64)
+    q_vals = np.array([completed_q.get(m, 0.0) for m in legal_moves], dtype=np.float64)
+
+    improved = logits + sigma * q_vals
+    improved -= improved.max()
+    exp_improved = np.exp(improved)
+    probs = exp_improved / (exp_improved.sum() + 1e-8)
+
+    for i, idx in enumerate(indices):
+        policy[idx] = float(probs[i])
+
+    return policy
+
+
+def sequential_halving(
+    tree: MCTSTree,
+    board: chess.Board,
+    candidate_moves: list[chess.Move],
+    num_simulations: int,
+    eval_fn,
+    cpuct: float = 1.25,
+) -> chess.Move:
+    """Allocate simulations via Sequential Halving, return winner.
+
+    Args:
+        tree: MCTS tree with root already expanded.
+        board: Board at root position.
+        candidate_moves: K moves from Gumbel-Top-K.
+        num_simulations: Total simulation budget.
+        eval_fn: Callable(board) -> (policy, value) for leaf evaluation.
+        cpuct: PUCT constant for non-root traversal.
+
+    Returns:
+        The winning move after Sequential Halving.
+    """
+    remaining = list(candidate_moves)
+    num_phases = max(1, int(np.ceil(np.log2(len(remaining)))))
+    sims_per_phase = max(1, num_simulations // num_phases)
+
+    for phase in range(num_phases):
+        if len(remaining) <= 1:
+            break
+
+        sims_per_action = max(1, sims_per_phase // len(remaining))
+
+        for move in remaining:
+            child_idx = tree.get_child_for_move(move)
+            if child_idx is None:
+                continue
+
+            # Build board with root move applied
+            child_board = board.copy(stack=False)
+            child_board.push(move)
+
+            for _ in range(sims_per_action):
+                if tree.is_terminal[child_idx]:
+                    tree.backup(child_idx, terminal_value(child_board))
+                    continue
+
+                if not tree.is_expanded[child_idx]:
+                    # Expand this child first
+                    policy, value = eval_fn(child_board)
+                    tree.expand(child_idx, child_board, policy)
+                    tree.backup(child_idx, value)
+                    continue
+
+                # Find leaf in subtree
+                leaf_idx, leaf_board = tree.find_leaf_in_subtree(
+                    child_idx, child_board, cpuct,
+                )
+
+                if tree.is_terminal[leaf_idx] or leaf_board.is_game_over(claim_draw=False):
+                    tree.backup(leaf_idx, terminal_value(leaf_board))
+                else:
+                    policy, value = eval_fn(leaf_board)
+                    tree.expand(leaf_idx, leaf_board, policy)
+                    tree.backup(leaf_idx, value)
+
+        # Eliminate worst half based on Q-values (from root's perspective)
+        q_values = tree.get_child_q_values(negate=True)
+        remaining.sort(key=lambda m: q_values.get(m, float('-inf')), reverse=True)
+        remaining = remaining[:max(1, len(remaining) // 2)]
+
+    return remaining[0]
+
+
+def select_gumbel_move(
+    candidate_moves: list[chess.Move],
+    gumbel_scores: np.ndarray,
+    q_values: dict[chess.Move, float],
+    sigma: float,
+) -> chess.Move:
+    """Select move using Gumbel scores + Q-values.
+
+    score(a) = gumbel_score(a) + sigma * Q(a)
+    """
+    best_score = float('-inf')
+    best_move = candidate_moves[0]
+    for i, move in enumerate(candidate_moves):
+        q = q_values.get(move, 0.0)
+        score = float(gumbel_scores[i]) + sigma * q if i < len(gumbel_scores) else sigma * q
+        if score > best_score:
+            best_score = score
+            best_move = move
+    return best_move
+
+
 # ── Single-game MCTS (for evaluation) ─────────────────────────────────────
 
 
@@ -249,10 +452,11 @@ class MCTS:
         """Evaluate one position with the neural network."""
         encoded = BoardEncoder.encode_board(board).unsqueeze(0).to(self.device)
         self.model.eval()
-        policy_logits, value = self.model(encoded)
+        policy_logits, values = _extract_policy_and_value(self.model(encoded))
 
         policy = torch.softmax(policy_logits.squeeze(0).float(), dim=0).cpu().numpy()
-        return policy, value.item()
+        value = values.squeeze(0).item()
+        return policy, value
 
     def search(self, board: chess.Board) -> dict[chess.Move, int]:
         """Run MCTS. Returns move visit counts."""
@@ -307,10 +511,10 @@ class BatchedMCTS:
 
         encoded = BoardEncoder.encode_board_batch(boards).to(self.device)
         self.model.eval()
-        policy_logits, values = self.model(encoded)
+        policy_logits, values = _extract_policy_and_value(self.model(encoded))
 
         policies = torch.softmax(policy_logits.float(), dim=-1).cpu().numpy()
-        return policies, values.squeeze(-1).float().cpu().numpy()
+        return policies, values.cpu().numpy()
 
     def search_batch(
         self, boards: list[chess.Board],

@@ -1,0 +1,71 @@
+# Metis self-play training — v10 Gumbel (2026-04-07)
+# Key changes from v9:
+#   - mcts_algorithm: gumbel (Gumbel AlphaZero with Sequential Halving)
+#   - mcts_simulations 800 → 200 (Gumbel is more sim-efficient)
+#   - decisive_boost 1.0 → 4.0 (PER: upweight decisive positions)
+#   - dirichlet_epsilon 0.25 → 0.0 (Gumbel noise replaces Dirichlet)
+#
+# Use with: bash scripts/launch.sh configs/selfplay_v10_gumbel.yaml
+
+# ── Model ───────────────────────────────────────────────────────────
+model:
+  size: medium
+  attn_res_boundaries: "0,1,3,9"
+  activation_checkpointing: false
+  compile: true
+
+# ── Self-play ───────────────────────────────────────────────────────
+self_play:
+  num_workers: 96
+  num_parallel_games: 192
+  mcts_simulations: 200             # Down from 800: Gumbel is more efficient
+  mcts_algorithm: gumbel            # Gumbel AlphaZero (Sequential Halving + improved policy)
+  gumbel_K: 16                      # Candidate actions at root
+  gumbel_c_visit: 50.0              # Sigma scaling for completed Q-values
+  games_per_iter: 256
+  max_moves: 200
+  num_virtual_leaves: 8
+  temperature_threshold: 30
+  dirichlet_epsilon: 0.0            # Disabled: Gumbel noise provides exploration
+
+# ── Training ────────────────────────────────────────────────────────
+training:
+  batch_size: 1024
+  train_steps_per_iter: 1000
+  num_iterations: 200
+  gradient_clip: 1.0
+  buffer_size: 1000000
+  decisive_boost: 4.0               # PER: 4x weight for win/loss positions
+
+# ── Evaluation ──────────────────────────────────────────────────────
+eval:
+  eval_every: 5
+  eval_games_per_depth: 20
+  eval_mcts_sims: 400
+  eval_depths: "1,3,5"
+
+# ── Monitoring ──────────────────────────────────────────────────────
+monitoring:
+  monitor: true
+  monitor_tier1_every: 500
+  monitor_tier2_every: 5000
+
+# ── Checkpointing ──────────────────────────────────────────────────
+checkpoint:
+  save_every: 5
+  checkpoint_dir: checkpoints/selfplay
+  resume: false
+
+# ── NCA Bootstrap ───────────────────────────────────────────────────
+nca:
+  nca_bootstrap: true
+
+# ── Infrastructure ──────────────────────────────────────────────────
+infra:
+  node: node2
+  gpu: 0
+  stockfish_path: ~/luxi-files/bin/stockfish
+  wandb: true
+  wandb_entity: aethera
+  wandb_project: metis
+  wandb_name: metis-gumbel-v10

@@ -205,9 +205,13 @@ class BoardEncoder:
         # Global token 2: side to move
         tokens[2] = 0 if board.turn == chess.WHITE else 1
 
-        # Square tokens via piece_map (faster than iterating all 64)
-        for sq, piece in board.piece_map().items():
-            tokens[3 + sq] = PIECE_TO_INDEX[piece]
+        # Square tokens via bitboard scanning (avoids Piece object creation
+        # that piece_map() does for each occupied square)
+        for piece_type in range(chess.PAWN, chess.KING + 1):
+            for sq in board.pieces(piece_type, chess.WHITE):
+                tokens[3 + sq] = piece_type
+            for sq in board.pieces(piece_type, chess.BLACK):
+                tokens[3 + sq] = piece_type + 6
 
     @staticmethod
     def encode_board_array(board: chess.Board) -> np.ndarray:
@@ -243,16 +247,31 @@ class MoveEncoder:
     """Encodes chess moves using AlphaZero's 8x8x73 policy format."""
 
     @staticmethod
-    def move_to_index(move: chess.Move) -> int:
-        """Convert a chess.Move to a policy index (0-4671)."""
+    def move_components_to_index(
+        from_sq: int,
+        to_sq: int,
+        promotion: Optional[int] = None,
+    ) -> int:
+        """Convert raw move components to a policy index (0-4671)."""
+        if promotion == 0:
+            promotion = None
+
         # Queen promotions share the same policy slot as the corresponding
         # queen-type move landing on the last rank.
-        if move.promotion == chess.QUEEN:
-            move = chess.Move(move.from_square, move.to_square)
+        if promotion == chess.QUEEN:
+            promotion = None
 
+        move_type = _compute_move_type(from_sq, to_sq, promotion)
+        return from_sq * NUM_MOVE_TYPES + move_type
+
+    @staticmethod
+    def move_to_index(move: chess.Move) -> int:
+        """Convert a chess.Move to a policy index (0-4671)."""
         try:
-            return MOVE_TO_INDEX[move]
-        except KeyError as exc:
+            return MoveEncoder.move_components_to_index(
+                move.from_square, move.to_square, move.promotion,
+            )
+        except (KeyError, ValueError) as exc:
             raise ValueError(f"Move is not encodable: {move}") from exc
 
     @staticmethod
