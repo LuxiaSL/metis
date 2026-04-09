@@ -872,17 +872,23 @@ def train(args: argparse.Namespace) -> None:
             recent_win_rates.pop(0)
         avg_win_rate = sum(recent_win_rates) / len(recent_win_rates)
 
+        # Mean |Q| at root — diagnostic for value head flatness
+        # Near zero = flat value landscape, want to see this climb
+        all_root_vals = [v for g in games for v in getattr(g, "root_values", [])]
+        mean_abs_q = sum(abs(v) for v in all_root_vals) / max(len(all_root_vals), 1)
+
         if is_main_process():
             evals_per_sec = iter_evals / max(selfplay_time, 1e-6)
             logger.info(
                 "Iter %d self-play: %d games (%d total) | %d pos (%d total) | "
                 "avg %.0f moves | W/B/D=%d/%d/%d (win%%=%.0f%%, trend=%.0f%%) | "
-                "%.1fs (%.0f evals/s) | buffer: %d",
+                "mean|Q|=%.3f | %.1fs (%.0f evals/s) | buffer: %d",
                 iteration, n_games, cumul_games,
                 total_positions, cumul_positions,
                 avg_game_len,
                 outcomes["white"], outcomes["black"], outcomes["draw"],
                 win_rate * 100, avg_win_rate * 100,
+                mean_abs_q,
                 selfplay_time, evals_per_sec,
                 len(replay_buffer),
             )
@@ -1024,6 +1030,7 @@ def train(args: argparse.Namespace) -> None:
                     "selfplay/win_rate_trend": avg_win_rate,
                     "selfplay/positions_per_sec": total_positions / max(selfplay_time, 1e-6),
                     "selfplay/evals_per_sec": iter_evals / max(selfplay_time, 1e-6),
+                    "selfplay/mean_abs_q": mean_abs_q,
                     # Cumulative totals
                     "cumulative/games": cumul_games,
                     "cumulative/positions": cumul_positions,

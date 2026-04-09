@@ -374,9 +374,12 @@ def _run_worker(
 
                     if ply < temperature_threshold:
                         probs = _softmax(legal_logits[np.newaxis])[0]
-                        move_idx = np.random.choice(len(legal_moves), p=probs)
                     else:
-                        move_idx = int(np.argmax(legal_logits))
+                        # Soft temperature (τ=0.5) instead of argmax to maintain
+                        # game diversity across fast moves in the 75% PCR path
+                        scaled = legal_logits * 2.0  # 1/τ = 1/0.5 = 2
+                        probs = _softmax(scaled[np.newaxis])[0]
+                    move_idx = np.random.choice(len(legal_moves), p=probs)
                     move = legal_moves[move_idx]
 
                 boards[i].push(move)
