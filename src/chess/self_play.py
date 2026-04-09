@@ -61,6 +61,8 @@ class GameRecord:
     activities: list[float] = field(default_factory=list)
     root_values: list[float] = field(default_factory=list)  # MCTS root value per training move
     surprise: list[float] = field(default_factory=list)  # KL(improved || prior) per training move
+    plies: list[int] = field(default_factory=list)  # actual ply when each training move was recorded
+    total_plies: int = 0  # total game length (set at game end, for moves-left computation)
     outcome: float = 0.0
 
     def __len__(self) -> int:
@@ -367,12 +369,13 @@ def _run_worker(
                     ))
                     kl_div = max(kl_div, 0.0)  # Clamp numerical noise
 
-                    # Record training data (position, improved policy, root value, surprise)
+                    # Record training data (position, improved policy, root value, surprise, ply)
                     records[i].positions.append(BoardEncoder.encode_board(boards[i]))
                     records[i].policies.append(torch.from_numpy(improved_policy))
                     records[i].activities.append(_legal_move_count(boards[i]) / 40.0)
                     records[i].root_values.append(root_values[i])
                     records[i].surprise.append(kl_div)
+                    records[i].plies.append(ply)
 
                     # Select move via Gumbel
                     if ply < temperature_threshold:
@@ -479,6 +482,7 @@ def _run_worker(
                 records[i].positions.append(BoardEncoder.encode_board(boards[i]))
                 records[i].policies.append(MoveEncoder.encode_policy(vc))
                 records[i].activities.append(_legal_move_count(boards[i]) / 40.0)
+                records[i].plies.append(ply_counts[i])
 
                 ply = ply_counts[i]
                 temp = temperature if ply < temperature_threshold else 0.0
@@ -495,14 +499,17 @@ def _run_worker(
             move = selected_moves.get(i)
             if move is None:
                 # No valid move — game already marked as finished above
+                records[i].total_plies = ply_counts[i]
                 finished_this_round.append(i)
             elif boards[i].is_game_over(claim_draw=True):
                 records[i].outcome = _get_outcome(boards[i])
+                records[i].total_plies = ply_counts[i]
                 finished_this_round.append(i)
             elif ply_counts[i] >= max_moves:
                 records[i].outcome = _material_adjudicate(
                     boards[i], threshold=material_adjudication_threshold,
                 )
+                records[i].total_plies = ply_counts[i]
                 finished_this_round.append(i)
             else:
                 # Tree reuse (AlphaZero) or fresh tree (Gumbel)
@@ -548,6 +555,8 @@ def _run_worker(
             "activities": record.activities,
             "root_values": record.root_values,
             "surprise": record.surprise,
+            "plies": record.plies,
+            "total_plies": record.total_plies,
             "outcome": record.outcome,
         }
         game_result_queue.put(("game", worker_id, serialized))
@@ -812,7 +821,7 @@ class _DoubleBufferedEvaluator:
         if n <= max_sub_batch:
             batch = board_tensor.to(self.device)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-                policy_logits, wdl_logits, _, _ = self.model(batch)
+                policy_logits, wdl_logits, *_ = self.model(batch)
             # Return raw logits (workers compute softmax locally when needed).
             # This enables Gumbel search which needs raw logits, and doesn't
             # hurt AlphaZero since expand() normalizes priors anyway.
@@ -827,7 +836,7 @@ class _DoubleBufferedEvaluator:
         for start in range(0, n, max_sub_batch):
             sub = board_tensor[start:start + max_sub_batch].to(self.device)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-                policy_logits, wdl_logits, _, _ = self.model(sub)
+                policy_logits, wdl_logits, *_ = self.model(sub)
             all_logits.append(policy_logits.float().cpu().numpy())
             wdl_probs = torch.softmax(wdl_logits.float(), dim=-1)
             all_values.append((wdl_probs[:, 2] - wdl_probs[:, 0]).cpu().numpy())
@@ -971,6 +980,8 @@ class ParallelSelfPlay:
                     activities=payload.get("activities", []),
                     root_values=payload.get("root_values", []),
                     surprise=payload.get("surprise", []),
+                    plies=payload.get("plies", []),
+                    total_plies=payload.get("total_plies", 0),
                     outcome=payload["outcome"],
                 )
                 completed_games.append(record)
@@ -1071,6 +1082,7 @@ class SelfPlayWorker:
                 record.activities.append(_legal_move_count(board) / 40.0)
                 record.root_values.append(0.0)  # Single-process path: no root value available
                 record.surprise.append(0.0)  # No surprise data without Gumbel search
+                record.plies.append(ply_counts[game_idx])
 
                 ply = ply_counts[game_idx]
                 temp = self.config.temperature if ply < self.config.temperature_threshold else 0.0
@@ -1081,10 +1093,12 @@ class SelfPlayWorker:
 
                 if board.is_game_over(claim_draw=True):
                     record.outcome = _get_outcome(board)
+                    record.total_plies = ply_counts[game_idx]
                 elif ply_counts[game_idx] >= self.config.max_moves:
                     record.outcome = _material_adjudicate(
                         board, threshold=self.config.material_adjudication_threshold,
                     )
+                    record.total_plies = ply_counts[game_idx]
                 else:
                     next_active.append(game_idx)
 

@@ -426,6 +426,8 @@ class ChessTransformer(nn.Module):
         self.material_fc2 = nn.Linear(aux_hidden, 1)
         self.activity_fc1 = nn.Linear(config.hidden_size, aux_hidden)
         self.activity_fc2 = nn.Linear(aux_hidden, 1)
+        self.moves_left_fc1 = nn.Linear(config.hidden_size, aux_hidden)
+        self.moves_left_fc2 = nn.Linear(aux_hidden, 1)
 
         # ── Block Attention Residuals ──────────────────────────────────
         if config.attn_res:
@@ -488,6 +490,8 @@ class ChessTransformer(nn.Module):
         nn.init.zeros_(self.material_fc2.bias)
         nn.init.zeros_(self.activity_fc2.weight)
         nn.init.zeros_(self.activity_fc2.bias)
+        nn.init.zeros_(self.moves_left_fc2.weight)
+        nn.init.zeros_(self.moves_left_fc2.bias)
 
     # ── AttnRes helpers ─────────────────────────────────────────────────
 
@@ -648,7 +652,7 @@ class ChessTransformer(nn.Module):
     def forward(
         self,
         board_tokens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Args:
@@ -659,6 +663,7 @@ class ChessTransformer(nn.Module):
             wdl_logits: (B, 3) win/draw/loss logits.
             material_pred: (B, 1) predicted material balance (normalized).
             activity_pred: (B, 1) predicted legal move count (normalized).
+            moves_left_pred: (B, 1) predicted remaining moves (normalized).
         """
         B = board_tokens.shape[0]
         x = self.backbone_forward(board_tokens)
@@ -675,10 +680,11 @@ class ChessTransformer(nn.Module):
         wdl_logits = self.value_fc2(F.relu(self.value_fc1(pooled))) # (B, 3)
 
         # Auxiliary heads
-        material_pred = self.material_fc2(F.relu(self.material_fc1(pooled)))  # (B, 1)
-        activity_pred = self.activity_fc2(F.relu(self.activity_fc1(pooled)))  # (B, 1)
+        material_pred = self.material_fc2(F.relu(self.material_fc1(pooled)))      # (B, 1)
+        activity_pred = self.activity_fc2(F.relu(self.activity_fc1(pooled)))      # (B, 1)
+        moves_left_pred = self.moves_left_fc2(F.relu(self.moves_left_fc1(pooled)))  # (B, 1)
 
-        return policy_logits, wdl_logits, material_pred, activity_pred
+        return policy_logits, wdl_logits, material_pred, activity_pred, moves_left_pred
 
     # ── NCA transition helpers ─────────────────────────────────────────
 
@@ -710,6 +716,8 @@ class ChessTransformer(nn.Module):
         nn.init.zeros_(self.material_fc2.bias)
         nn.init.zeros_(self.activity_fc2.weight)
         nn.init.zeros_(self.activity_fc2.bias)
+        nn.init.zeros_(self.moves_left_fc2.weight)
+        nn.init.zeros_(self.moves_left_fc2.bias)
 
     def reinit_mlps(self) -> None:
         """Reinitialize all MLP weights (optional, after NCA pre-training)."""

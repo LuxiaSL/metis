@@ -19,6 +19,7 @@ _TOKEN_MATERIAL = torch.tensor(
 )
 _MATERIAL_NORM = 39.0  # max per-side material (standard starting)
 _ACTIVITY_NORM = 40.0  # typical legal move count
+_MOVES_LEFT_NORM = 150.0  # typical max game length in plies for normalization
 
 
 class ReplayBuffer:
@@ -34,6 +35,7 @@ class ReplayBuffer:
         self.materials = torch.zeros(capacity, dtype=torch.float32)
         self.activities = torch.zeros(capacity, dtype=torch.float32)
         self.surprises = torch.ones(capacity, dtype=torch.float32)  # KL(improved || prior), default 1.0
+        self.moves_left = torch.zeros(capacity, dtype=torch.float32)  # normalized remaining moves
         self.weights = torch.ones(capacity, dtype=torch.float32)
         self._index: int = 0
         self._size: int = 0
@@ -70,6 +72,8 @@ class ReplayBuffer:
         has_activities = hasattr(record, "activities") and len(record.activities) > 0
         has_root_values = hasattr(record, "root_values") and len(record.root_values) > 0
         has_surprise = hasattr(record, "surprise") and len(record.surprise) > 0
+        has_plies = hasattr(record, "plies") and len(record.plies) > 0
+        total_plies = getattr(record, "total_plies", 0)
 
         for i, (board, policy) in enumerate(zip(record.positions, record.policies)):
             # Even ply = white to move, odd ply = black to move
@@ -97,6 +101,12 @@ class ReplayBuffer:
             else:
                 self.surprises[self._index] = 1.0  # Default: no surprise weighting
 
+            # Moves-left: (total_plies - ply_at_position) / 150, normalized
+            if has_plies and i < len(record.plies) and total_plies > 0:
+                self.moves_left[self._index] = max(0, total_plies - record.plies[i]) / _MOVES_LEFT_NORM
+            else:
+                self.moves_left[self._index] = 0.0
+
             # PER: decisive positions (win/loss) get higher sampling weight
             weight = self.decisive_boost if abs(record.outcome) > 0.5 else 1.0
             self.weights[self._index] = weight
@@ -106,7 +116,7 @@ class ReplayBuffer:
 
     def sample(
         self, batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample a random batch of training examples.
 
         Returns:
@@ -117,6 +127,7 @@ class ReplayBuffer:
             materials: (B,) float tensor (normalized material balance)
             activities: (B,) float tensor (normalized legal move count)
             surprises: (B,) float tensor — KL(improved || prior) per position
+            moves_left: (B,) float tensor — normalized remaining game length
 
         Raises:
             ValueError: If buffer has fewer samples than batch_size.
@@ -140,6 +151,7 @@ class ReplayBuffer:
             self.materials[indices],
             self.activities[indices],
             self.surprises[indices],
+            self.moves_left[indices],
         )
 
     def clear(self) -> None:
@@ -162,6 +174,7 @@ class ReplayBuffer:
             "materials": self.materials[:n].clone(),
             "activities": self.activities[:n].clone(),
             "surprises": self.surprises[:n].clone(),
+            "moves_left": self.moves_left[:n].clone(),
             "weights": self.weights[:n].clone(),
             "index": self._index,
             "size": self._size,
@@ -200,6 +213,10 @@ class ReplayBuffer:
         if "surprises" in state:
             self.surprises[:n] = state["surprises"]
         # else: surprises stay at 1.0 (uniform — backward compatible)
+
+        if "moves_left" in state:
+            self.moves_left[:n] = state["moves_left"]
+        # else: moves_left stay at 0.0 (no way to recompute retroactively)
 
         if "weights" in state:
             self.weights[:n] = state["weights"]

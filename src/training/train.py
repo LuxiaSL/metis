@@ -496,14 +496,17 @@ def compute_loss(
     wdl_logits: torch.Tensor,
     material_pred: torch.Tensor,
     activity_pred: torch.Tensor,
+    moves_left_pred: torch.Tensor,
     target_policy: torch.Tensor,
     target_value: torch.Tensor,
     target_q_value: torch.Tensor,
     target_material: torch.Tensor,
     target_activity: torch.Tensor,
+    target_moves_left: torch.Tensor,
     z_loss_weight: float = 1e-5,
     material_loss_weight: float = 0.1,
     activity_loss_weight: float = 0.05,
+    moves_left_loss_weight: float = 0.02,
     q_blend: float = 0.0,
     sample_weights: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
@@ -514,46 +517,47 @@ def compute_loss(
         wdl_logits: (B, 3) win/draw/loss logits from model.
         material_pred: (B, 1) predicted material balance.
         activity_pred: (B, 1) predicted legal move count.
+        moves_left_pred: (B, 1) predicted remaining game length.
         target_policy: (B, 4672) MCTS visit count distributions (sums to 1).
         target_value: (B,) z-targets — game outcomes {-1, 0, +1} from side-to-move.
         target_q_value: (B,) q-targets — MCTS root values from side-to-move.
         target_material: (B,) normalized material balance.
         target_activity: (B,) normalized legal move count.
+        target_moves_left: (B,) normalized remaining game length.
         z_loss_weight: z-loss coefficient for policy logit regularization.
         material_loss_weight: weight for material prediction auxiliary loss.
         activity_loss_weight: weight for activity prediction auxiliary loss.
+        moves_left_loss_weight: weight for moves-left prediction auxiliary loss.
         q_blend: blend factor for value target — 0.0 = pure z, 1.0 = pure q.
         sample_weights: (B,) optional per-sample weights from policy surprise.
-            When provided, per-sample losses are weighted before averaging.
 
     Returns:
         Dict with 'loss', 'policy_loss', 'value_loss', 'z_loss',
-        'material_loss', 'activity_loss' tensors.
+        'material_loss', 'activity_loss', 'moves_left_loss' tensors.
     """
     # Policy loss: cross-entropy between MCTS policy and model policy
     log_probs = F.log_softmax(policy_logits, dim=-1)
     per_sample_policy = -(target_policy * log_probs).sum(dim=-1)  # (B,)
 
     # WDL value loss: blend z-target (game outcome) and q-target (MCTS root value)
-    # as soft WDL distributions, then use soft cross-entropy.
     if q_blend > 0.0:
-        z_wdl = _scalar_to_soft_wdl(target_value)     # (B, 3) hard-ish from {-1,0,+1}
-        q_wdl = _scalar_to_soft_wdl(target_q_value)    # (B, 3) soft from continuous [-1,1]
+        z_wdl = _scalar_to_soft_wdl(target_value)
+        q_wdl = _scalar_to_soft_wdl(target_q_value)
         target_wdl = (1.0 - q_blend) * z_wdl + q_blend * q_wdl
         wdl_log_probs = F.log_softmax(wdl_logits, dim=-1)
-        per_sample_value = -(target_wdl * wdl_log_probs).sum(dim=-1)  # (B,)
+        per_sample_value = -(target_wdl * wdl_log_probs).sum(dim=-1)
     else:
-        # Pure z-target: standard hard cross-entropy (per-sample)
-        target_class = (target_value + 1).long()  # {-1,0,+1} → {0,1,2}
-        per_sample_value = F.cross_entropy(wdl_logits, target_class, reduction="none")  # (B,)
+        target_class = (target_value + 1).long()
+        per_sample_value = F.cross_entropy(wdl_logits, target_class, reduction="none")
 
-    # z-loss: prevent policy logit explosion (from luxia-base)
+    # z-loss: prevent policy logit explosion
     log_z = torch.logsumexp(policy_logits, dim=-1)
-    per_sample_z = z_loss_weight * (log_z ** 2)  # (B,)
+    per_sample_z = z_loss_weight * (log_z ** 2)
 
     # Auxiliary losses (per-sample)
-    per_sample_material = (material_pred.squeeze(-1) - target_material) ** 2  # (B,)
-    per_sample_activity = (activity_pred.squeeze(-1) - target_activity) ** 2  # (B,)
+    per_sample_material = (material_pred.squeeze(-1) - target_material) ** 2
+    per_sample_activity = (activity_pred.squeeze(-1) - target_activity) ** 2
+    per_sample_moves_left = (moves_left_pred.squeeze(-1) - target_moves_left) ** 2
 
     per_sample_loss = (
         per_sample_policy
@@ -561,7 +565,8 @@ def compute_loss(
         + per_sample_z
         + material_loss_weight * per_sample_material
         + activity_loss_weight * per_sample_activity
-    )  # (B,)
+        + moves_left_loss_weight * per_sample_moves_left
+    )
 
     if sample_weights is not None:
         total_loss = (per_sample_loss * sample_weights).mean()
@@ -569,19 +574,14 @@ def compute_loss(
         total_loss = per_sample_loss.mean()
 
     # Report unweighted component means for logging consistency
-    policy_loss = per_sample_policy.mean()
-    value_loss = per_sample_value.mean()
-    z_loss = per_sample_z.mean()
-    material_loss = per_sample_material.mean()
-    activity_loss = per_sample_activity.mean()
-
     return {
         "loss": total_loss,
-        "policy_loss": policy_loss,
-        "value_loss": value_loss,
-        "z_loss": z_loss,
-        "material_loss": material_loss,
-        "activity_loss": activity_loss,
+        "policy_loss": per_sample_policy.mean(),
+        "value_loss": per_sample_value.mean(),
+        "z_loss": per_sample_z.mean(),
+        "material_loss": per_sample_material.mean(),
+        "activity_loss": per_sample_activity.mean(),
+        "moves_left_loss": per_sample_moves_left.mean(),
     }
 
 
@@ -922,7 +922,7 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         train_metrics: dict[str, float] = {
             "loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "z_loss": 0.0,
-            "material_loss": 0.0, "activity_loss": 0.0,
+            "material_loss": 0.0, "activity_loss": 0.0, "moves_left_loss": 0.0,
         }
         grad_norm_sum = 0.0
         train_start = time.time()
@@ -944,7 +944,7 @@ def train(args: argparse.Namespace) -> None:
         surprise_sum = 0.0
 
         for step in range(num_train_steps):
-            boards, target_policies, target_values, target_q_values, target_materials, target_activities, surprises = (
+            boards, target_policies, target_values, target_q_values, target_materials, target_activities, surprises, target_moves_left = (
                 replay_buffer.sample(args.batch_size)
             )
 
@@ -957,6 +957,7 @@ def train(args: argparse.Namespace) -> None:
             target_q_values = target_q_values.to(device)
             target_materials = target_materials.to(device)
             target_activities = target_activities.to(device)
+            target_moves_left = target_moves_left.to(device)
 
             # Policy surprise weighting: 50% uniform + 50% proportional to surprise
             surprise_mean = surprises.mean().item()
@@ -968,11 +969,11 @@ def train(args: argparse.Namespace) -> None:
             sample_weights = sample_weights.to(device)
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                policy_logits, wdl_logits, material_pred, activity_pred = model(boards)
+                policy_logits, wdl_logits, material_pred, activity_pred, moves_left_pred = model(boards)
                 losses = compute_loss(
-                    policy_logits, wdl_logits, material_pred, activity_pred,
+                    policy_logits, wdl_logits, material_pred, activity_pred, moves_left_pred,
                     target_policies, target_values, target_q_values,
-                    target_materials, target_activities,
+                    target_materials, target_activities, target_moves_left,
                     z_loss_weight=config.z_loss_weight,
                     q_blend=args.q_blend,
                     sample_weights=sample_weights,
@@ -1013,7 +1014,7 @@ def train(args: argparse.Namespace) -> None:
             lrs = scheduler.get_last_lr()
             draw_rate = outcomes["draw"] / max(len(games), 1)
             logger.info(
-                "Iter %d train [step %d]: loss=%.4f (pol=%.4f val=%.4f z=%.6f mat=%.4f act=%.4f) "
+                "Iter %d train [step %d]: loss=%.4f (pol=%.4f val=%.4f z=%.6f mat=%.4f act=%.4f mlh=%.4f) "
                 "grad=%.2f decisive=%.0f%% | %.1fs (%.0fs total)",
                 iteration,
                 global_train_step,
@@ -1023,6 +1024,7 @@ def train(args: argparse.Namespace) -> None:
                 train_metrics["z_loss"],
                 train_metrics["material_loss"],
                 train_metrics["activity_loss"],
+                train_metrics["moves_left_loss"],
                 grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                 avg_decisive_frac * 100,
                 train_time,
@@ -1078,7 +1080,7 @@ def train(args: argparse.Namespace) -> None:
                 probe = monitor._probe_batch
                 if probe is not None:
                     with torch.no_grad():
-                        p_logits, _, _, _ = raw_model(probe.to(device))
+                        p_logits, *_ = raw_model(probe.to(device))
                     geo_metrics = monitor.tier1(global_train_step, policy_logits=p_logits)
                     if wandb_run is not None:
                         iter_log_dict.update(geo_metrics)
