@@ -888,8 +888,13 @@ def train(args: argparse.Namespace) -> None:
 
         # Mean |Q| at root — diagnostic for value head flatness
         # Near zero = flat value landscape, want to see this climb
-        all_root_vals = [v for g in games for v in getattr(g, "root_values", [])]
-        mean_abs_q = sum(abs(v) for v in all_root_vals) / max(len(all_root_vals), 1)
+        # root_wdl is list of [p_loss, p_draw, p_win]; Q = p_win - p_loss
+        all_root_q = [
+            abs(wdl[2] - wdl[0])
+            for g in games
+            for wdl in getattr(g, "root_wdl", [])
+        ]
+        mean_abs_q = sum(all_root_q) / max(len(all_root_q), 1)
 
         if is_main_process():
             evals_per_sec = iter_evals / max(selfplay_time, 1e-6)
