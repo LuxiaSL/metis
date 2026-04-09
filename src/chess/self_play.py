@@ -34,7 +34,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as tmp
 
-from src.chess.board import BoardEncoder, MoveEncoder, SEQ_LEN, POLICY_SIZE
+from src.chess.board import BoardEncoder, MoveEncoder, SEQ_LEN, POLICY_SIZE, mirror_policy
 from src.chess.bitboard import Board as BitboardBoard
 from src.chess.mcts import (
     MCTSConfig, BatchedMCTS, GumbelConfig,
@@ -281,12 +281,15 @@ def _run_worker(
         boards_to_eval = [boards[i] for i in active_list]
         logits_batch, wdl_batch = _request_eval(boards_to_eval)
         for j, i in enumerate(active_list):
-            # Store raw logits and WDL for Gumbel path
-            root_logits[i] = logits_batch[j].copy()
-            root_wdl[i] = wdl_batch[j].copy()  # (3,) WDL probs
+            # Copy logits and unmirror to actual-move space for MCTS/Gumbel
+            logits_j = logits_batch[j].copy()
+            if boards[i].turn == chess.BLACK:
+                logits_j = mirror_policy(logits_j)
+            root_logits[i] = logits_j
+            root_wdl[i] = wdl_batch[j].copy()  # (3,) WDL probs — already from STM perspective
             root_values[i] = float(wdl_batch[j][2] - wdl_batch[j][0])  # scalar for MCTS
-            # Softmax for tree expansion priors
-            probs = _softmax(logits_batch[j:j+1])[0]
+            # Softmax for tree expansion priors (actual-move space)
+            probs = _softmax(logits_j[np.newaxis])[0]
             trees[i].expand(trees[i].root, boards[i], probs)
             trees[i].add_dirichlet_noise(
                 trees[i].root,
@@ -299,14 +302,19 @@ def _run_worker(
     def _eval_vl_batch(boards_to_eval: list) -> tuple[np.ndarray, np.ndarray]:
         """Evaluate a list of boards via the shared evaluator.
 
-        Returns (softmax_policies, scalar_values). Used by sequential_halving
-        with num_virtual_leaves > 1 for batched leaf evaluation.
+        Returns (softmax_policies, scalar_values) in actual-move space.
+        Used by sequential_halving with num_virtual_leaves > 1.
         """
         if not boards_to_eval:
             return np.empty((0, POLICY_SIZE), dtype=np.float32), np.empty(0, dtype=np.float32)
         logits_batch, wdl_batch = _request_eval(boards_to_eval)
+        policies = _softmax(logits_batch)
+        # Unmirror policies for black-to-move leaves
+        for k, b in enumerate(boards_to_eval):
+            if b.turn == chess.BLACK:
+                policies[k] = mirror_policy(policies[k])
         values = wdl_batch[:, 2] - wdl_batch[:, 0]  # WDL→scalar for MCTS backup
-        return _softmax(logits_batch), values
+        return policies, values
 
     # Track selected moves per game for tree reuse
     selected_moves: dict[int, Optional[chess.Move]] = {}
@@ -338,9 +346,28 @@ def _run_worker(
 
                 if is_training_move:
                     # ── Full search: Gumbel SH → record training data ──
+                    # Early-ply Dirichlet noise: force opening exploration
+                    # even when the prior is sharply peaked (prevents Ke2-style collapse)
+                    if ply < 10 and mcts_config.dirichlet_alpha > 0:
+                        legal_indices_arr = np.array(
+                            [MoveEncoder.move_to_index(m) for m in legal_moves],
+                            dtype=np.intp,
+                        )
+                        legal_probs = _softmax(logits_i[legal_indices_arr][np.newaxis])[0]
+                        noise = np.random.dirichlet(
+                            [mcts_config.dirichlet_alpha] * len(legal_moves),
+                        ).astype(np.float32)
+                        noisy_probs = 0.75 * legal_probs + 0.25 * noise
+                        # Convert back to logits for Gumbel Top-K
+                        noisy_logits = logits_i.copy()
+                        noisy_logits[legal_indices_arr] = np.log(noisy_probs + 1e-8)
+                        search_logits = noisy_logits
+                    else:
+                        search_logits = logits_i
+
                     K = min(gumbel_config.max_K, len(legal_moves))
                     legal_indices = [MoveEncoder.move_to_index(m) for m in legal_moves]
-                    selected_indices, gumbel_scores = gumbel_top_k(logits_i, legal_indices, K)
+                    selected_indices, gumbel_scores = gumbel_top_k(search_logits, legal_indices, K)
 
                     idx_to_move = {MoveEncoder.move_to_index(m): m for m in legal_moves}
                     candidate_moves = [idx_to_move[si] for si in selected_indices]
@@ -373,8 +400,12 @@ def _run_worker(
                     kl_div = max(kl_div, 0.0)  # Clamp numerical noise
 
                     # Record training data (position, improved policy, root value, surprise, ply)
+                    # Position is auto-flipped by encode_board; policy must match (model-space)
+                    training_policy = improved_policy
+                    if boards[i].turn == chess.BLACK:
+                        training_policy = mirror_policy(training_policy)
                     records[i].positions.append(BoardEncoder.encode_board(boards[i]))
-                    records[i].policies.append(torch.from_numpy(improved_policy))
+                    records[i].policies.append(torch.from_numpy(training_policy))
                     records[i].activities.append(_legal_move_count(boards[i]) / 40.0)
                     records[i].root_wdl.append(root_wdl[i].tolist())
                     records[i].surprise.append(kl_div)
@@ -466,13 +497,17 @@ def _run_worker(
 
                 if leaves:
                     leaf_boards = [lb for _, _, lb, _ in leaves]
-                    logits_batch, values = _request_eval(leaf_boards)
+                    logits_batch, wdl_batch = _request_eval(leaf_boards)
 
                     for j, (game_idx, leaf_idx, lb, path) in enumerate(leaves):
                         probs = _softmax(logits_batch[j:j+1])[0]
+                        # Unmirror policy for black-to-move leaves
+                        if lb.turn == chess.BLACK:
+                            probs = mirror_policy(probs)
+                        value = float(wdl_batch[j][2] - wdl_batch[j][0])
                         trees[game_idx].expand(leaf_idx, lb, probs)
                         trees[game_idx].remove_virtual_loss(path)
-                        trees[game_idx].backup(leaf_idx, values[j])
+                        trees[game_idx].backup(leaf_idx, value)
 
             # Select moves for AlphaZero path
             for i in active_list:
@@ -482,8 +517,9 @@ def _run_worker(
                     selected_moves[i] = None
                     continue
 
+                flip = boards[i].turn == chess.BLACK
                 records[i].positions.append(BoardEncoder.encode_board(boards[i]))
-                records[i].policies.append(MoveEncoder.encode_policy(vc))
+                records[i].policies.append(MoveEncoder.encode_policy(vc, flip=flip))
                 records[i].activities.append(_legal_move_count(boards[i]) / 40.0)
                 records[i].plies.append(ply_counts[i])
 
@@ -541,10 +577,13 @@ def _run_worker(
             boards_to_eval = [boards[i] for i in unexpanded]
             logits_batch, wdl_batch = _request_eval(boards_to_eval)
             for j, i in enumerate(unexpanded):
-                root_logits[i] = logits_batch[j].copy()
+                logits_j = logits_batch[j].copy()
+                if boards[i].turn == chess.BLACK:
+                    logits_j = mirror_policy(logits_j)
+                root_logits[i] = logits_j
                 root_wdl[i] = wdl_batch[j].copy()
                 root_values[i] = float(wdl_batch[j][2] - wdl_batch[j][0])
-                probs = _softmax(logits_batch[j:j+1])[0]
+                probs = _softmax(logits_j[np.newaxis])[0]
                 trees[i].expand(trees[i].root, boards[i], probs)
                 trees[i].add_dirichlet_noise(
                     trees[i].root,
@@ -1079,8 +1118,9 @@ class SelfPlayWorker:
                     record.outcome = _get_outcome(board)
                     continue
 
+                flip = board.turn == chess.BLACK
                 record.positions.append(BoardEncoder.encode_board(board))
-                record.policies.append(MoveEncoder.encode_policy(vc))
+                record.policies.append(MoveEncoder.encode_policy(vc, flip=flip))
                 record.activities.append(_legal_move_count(board) / 40.0)
                 record.root_wdl.append([1/3, 1/3, 1/3])  # Single-process path: uniform WDL fallback
                 record.surprise.append(0.0)  # No surprise data without Gumbel search

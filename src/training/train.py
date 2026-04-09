@@ -871,6 +871,19 @@ def train(args: argparse.Namespace) -> None:
         for game in games:
             replay_buffer.add_game(game)
 
+        # SF-anchored positions: external signal to break self-play circular learning
+        sf_anchor_count = 0
+        if args.sf_anchor_positions > 0 and is_main_process():
+            from src.training.sf_anchor import generate_sf_anchored_positions
+            sf_records = generate_sf_anchored_positions(
+                stockfish_path=args.stockfish_path,
+                num_positions=args.sf_anchor_positions,
+                depth=args.sf_anchor_depth,
+            )
+            for rec in sf_records:
+                replay_buffer.add_game(rec)
+            sf_anchor_count = len(sf_records)
+
         # Accumulate cumulative counters
         n_games = len(games)
         cumul_games += n_games
@@ -911,6 +924,8 @@ def train(args: argparse.Namespace) -> None:
                 selfplay_time, evals_per_sec,
                 len(replay_buffer),
             )
+            if sf_anchor_count > 0:
+                logger.info("  + %d SF-anchored positions added to buffer", sf_anchor_count)
 
         # Set probe batch for monitoring (once, from first generation)
         if monitor is not None and monitor._probe_batch is None and len(replay_buffer) >= 64:
@@ -1219,6 +1234,10 @@ def parse_args() -> argparse.Namespace:
                         help="Material diff for win/loss adjudication at max_moves (9.0=queen, 3.0=old default)")
     parser.add_argument("--fast_move_sims", type=int, default=0,
                         help="Gumbel sims for PCR fast moves (0=raw policy, 32-50=light search)")
+    parser.add_argument("--sf_anchor_positions", type=int, default=0,
+                        help="SF-evaluated positions per iter for value/policy anchoring (0=disabled)")
+    parser.add_argument("--sf_anchor_depth", type=int, default=8,
+                        help="Stockfish search depth for anchor positions")
 
     # Optimizer
     parser.add_argument("--muon_lr", type=float, default=0.02)

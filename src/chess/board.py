@@ -3,19 +3,27 @@
 Board encoding: 67 tokens (3 global + 64 squares)
 Move encoding: AlphaZero 8x8x73 = 4672 policy outputs
 
+Perspective canonicalization: all positions are encoded from the current
+player's perspective. When black to move, the board is rank-mirrored and
+colors swapped so the model always sees "my pieces on ranks 1-2."
+
 Global tokens:
-  [0] castling rights (0-15, 4-bit packed)
+  [0] castling rights (0-15, 4-bit packed; swapped for black-to-move)
   [1] en passant file (0-7, or 8 for none)
-  [2] side to move (0=white, 1=black)
+  [2] side to move (always 0 — always "current player")
 
 Square tokens (indices 3-66):
   Piece type index 0-12: empty, P, N, B, R, Q, K, p, n, b, r, q, k
-  Ordered by square index (0=a1, 1=b1, ..., 63=h8)
+  (1-6 = current player's pieces, 7-12 = opponent's pieces)
+  Ordered by square index (0=a1, 1=b1, ..., 63=h8; rank-mirrored for black)
 
 Move types per square (73 total):
   0-55:  Queen-type moves (8 directions x 7 distances)
   56-63: Knight moves (8 L-shaped offsets)
   64-72: Underpromotions (3 pieces x 3 directions)
+
+Policy mirroring: model outputs are in "model-space" (perspective-canonical).
+Use mirror_policy() to convert between model-space and actual-board-space.
 """
 
 from __future__ import annotations
@@ -176,6 +184,60 @@ MOVE_TO_INDEX: dict[chess.Move, int] = {
 }
 
 
+# ── Perspective mirror table ──────────────────────────────────────────────
+
+# Direction mirrors for rank-flip (sq ^ 56): rank deltas negate, file deltas stay.
+# Queen directions: 0=N 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW
+_MIRROR_QUEEN_DIR: list[int] = [4, 3, 2, 1, 0, 7, 6, 5]
+# Knight offsets: (2,1) (2,-1) (1,2) (1,-2) (-1,2) (-1,-2) (-2,1) (-2,-1)
+_MIRROR_KNIGHT: list[int] = [6, 7, 4, 5, 2, 3, 0, 1]
+
+
+def _build_mirror_policy_table() -> np.ndarray:
+    """Build table mapping each policy index to its perspective-mirrored index.
+
+    Mirroring flips ranks (sq ^ 56) and inverts rank-relative move directions.
+    This table is its own inverse: table[table[i]] == i for all i.
+    """
+    table = np.arange(POLICY_SIZE, dtype=np.int32)
+
+    for i in range(POLICY_SIZE):
+        from_sq = i // NUM_MOVE_TYPES
+        move_type = i % NUM_MOVE_TYPES
+        mirrored_from = from_sq ^ 56
+
+        if move_type < 56:
+            # Queen-type: flip direction, keep distance
+            direction = move_type // 7
+            distance = move_type % 7
+            mirrored_type = _MIRROR_QUEEN_DIR[direction] * 7 + distance
+        elif move_type < 64:
+            # Knight: flip rank component of L-shape
+            mirrored_type = 56 + _MIRROR_KNIGHT[move_type - 56]
+        else:
+            # Underpromotion: file direction unchanged by rank mirror
+            mirrored_type = move_type
+
+        table[i] = mirrored_from * NUM_MOVE_TYPES + mirrored_type
+
+    return table
+
+
+_MIRROR_POLICY_TABLE: np.ndarray = _build_mirror_policy_table()
+
+
+def mirror_policy(policy: np.ndarray) -> np.ndarray:
+    """Mirror a policy vector between model-space and actual-move space.
+
+    Reindexes a (4672,) policy vector to flip perspective. The model always
+    sees positions as "current player to move" with ranks flipped for black.
+    This function converts between that model-space and actual board-space.
+
+    Self-inverse: mirror_policy(mirror_policy(p)) == p.
+    """
+    return policy[_MIRROR_POLICY_TABLE]
+
+
 # ── Public API ─────────────────────────────────────────────────────────────
 
 
@@ -184,8 +246,18 @@ class BoardEncoder:
 
     @staticmethod
     def _encode_into(board: chess.Board, tokens: np.ndarray) -> None:
-        """Encode a board into a preallocated token array."""
+        """Encode a board into a preallocated token array.
+
+        Perspective canonicalization: when black to move, the board is
+        mirrored so the model always sees "current player's pieces on
+        ranks 1-2, opponent's on ranks 7-8." Specifically:
+          - Square order flipped: sq → sq ^ 56 (rank mirror)
+          - Piece colors swapped: indices 1-6 ↔ 7-12
+          - Castling bits swapped: white (0-1) ↔ black (2-3)
+          - Side-to-move token: always 0 (always "current player")
+        """
         tokens.fill(0)
+        flip = board.turn == chess.BLACK
 
         # Global token 0: castling rights (4-bit packed)
         castling = 0
@@ -197,21 +269,33 @@ class BoardEncoder:
             castling |= 4
         if board.has_queenside_castling_rights(chess.BLACK):
             castling |= 8
+        if flip:
+            # Swap white (bits 0-1) and black (bits 2-3) castling rights
+            castling = ((castling & 0x3) << 2) | ((castling >> 2) & 0x3)
         tokens[0] = castling
 
         # Global token 1: en passant file (0-7) or 8 (none)
+        # File is invariant under rank mirroring (sq ^ 56 preserves file)
         tokens[1] = chess.square_file(board.ep_square) if board.ep_square is not None else 8
 
-        # Global token 2: side to move
-        tokens[2] = 0 if board.turn == chess.WHITE else 1
+        # Global token 2: side to move — always 0 (current player's perspective)
+        tokens[2] = 0
 
         # Square tokens via bitboard scanning (avoids Piece object creation
         # that piece_map() does for each occupied square)
-        for piece_type in range(chess.PAWN, chess.KING + 1):
-            for sq in board.pieces(piece_type, chess.WHITE):
-                tokens[3 + sq] = piece_type
-            for sq in board.pieces(piece_type, chess.BLACK):
-                tokens[3 + sq] = piece_type + 6
+        if flip:
+            # Mirror: swap colors and flip ranks
+            for piece_type in range(chess.PAWN, chess.KING + 1):
+                for sq in board.pieces(piece_type, chess.WHITE):
+                    tokens[3 + (sq ^ 56)] = piece_type + 6  # White → opponent (7-12)
+                for sq in board.pieces(piece_type, chess.BLACK):
+                    tokens[3 + (sq ^ 56)] = piece_type      # Black → current player (1-6)
+        else:
+            for piece_type in range(chess.PAWN, chess.KING + 1):
+                for sq in board.pieces(piece_type, chess.WHITE):
+                    tokens[3 + sq] = piece_type
+                for sq in board.pieces(piece_type, chess.BLACK):
+                    tokens[3 + sq] = piece_type + 6
 
     @staticmethod
     def encode_board_array(board: chess.Board) -> np.ndarray:
@@ -297,8 +381,16 @@ class MoveEncoder:
         return mask
 
     @staticmethod
-    def encode_policy(visit_counts: dict[chess.Move, int]) -> torch.Tensor:
+    def encode_policy(
+        visit_counts: dict[chess.Move, int],
+        flip: bool = False,
+    ) -> torch.Tensor:
         """Convert MCTS visit counts to a normalized policy distribution.
+
+        Args:
+            visit_counts: Move → visit count mapping (actual-move space).
+            flip: If True, output in model-space (perspective-mirrored).
+                  Use flip=True when the position was black to move.
 
         Returns:
             Tensor shape (4672,) dtype=float32, sums to 1.
@@ -310,6 +402,8 @@ class MoveEncoder:
         for move, count in visit_counts.items():
             try:
                 idx = MoveEncoder.move_to_index(move)
+                if flip:
+                    idx = int(_MIRROR_POLICY_TABLE[idx])
                 policy[idx] = count / total
             except ValueError:
                 pass
@@ -323,8 +417,11 @@ class MoveEncoder:
     ) -> chess.Move:
         """Select a move from policy logits with legal-move masking.
 
+        Expects policy_logits in model-space (as returned by the network).
+        Automatically unmirrors for black-to-move positions.
+
         Args:
-            policy_logits: Raw logits shape (4672,).
+            policy_logits: Raw logits shape (4672,) in model-space.
             board: Current position (for legal move filtering).
             temperature: 0 = greedy, >0 = softmax sampling.
 
@@ -334,6 +431,11 @@ class MoveEncoder:
         Raises:
             ValueError: If no legal moves available.
         """
+        # Unmirror from model-space to actual-move space if needed
+        if board.turn == chess.BLACK:
+            table = torch.from_numpy(_MIRROR_POLICY_TABLE.astype(np.int64))
+            policy_logits = policy_logits[table]
+
         mask = MoveEncoder.legal_move_mask(board)
         if not mask.any():
             raise ValueError("No legal moves available")

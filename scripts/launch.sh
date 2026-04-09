@@ -60,6 +60,8 @@ iters = get('training.num_iterations', 200)
 buffer = get('training.buffer_size', 1000000)
 decisive = get('training.decisive_boost', 1.0)
 q_blend = get('training.q_blend', 0.0)
+sf_anchor = get('training.sf_anchor_positions', 0)
+sf_anchor_depth = get('training.sf_anchor_depth', 8)
 
 # Self-play (continued)
 pcr_frac = get('self_play.playout_cap_fraction', 1.0)
@@ -125,6 +127,9 @@ if float(pcr_frac) < 1.0:
 if int(fast_move_sims) > 0:
     args.append(f'--fast_move_sims {fast_move_sims}')
 args.append(f'--material_adjudication_threshold {mat_adj_thresh}')
+if int(sf_anchor) > 0:
+    args.append(f'--sf_anchor_positions {sf_anchor}')
+    args.append(f'--sf_anchor_depth {sf_anchor_depth}')
 args.append(f'--eval_every {eval_every}')
 args.append(f'--eval_games_per_depth {eval_gpd}')
 args.append(f'--eval_mcts_sims {eval_sims}')

@@ -63,8 +63,11 @@ class ReplayBuffer:
         Values (z-targets) are stored from the perspective of the side to move.
         White positions get outcome directly; black positions get -outcome.
         Q-values (MCTS root values) are also stored per position for blended
-        value targets. With PCR, only training moves have positions recorded,
-        so the ply index tracks position order (not absolute game ply).
+        value targets.
+
+        With perspective canonicalization, board encodings always represent
+        "current player to move" — the actual ply (from record.plies) determines
+        sign. This also fixes PCR where recorded positions may skip plies.
 
         Material is computed from board tokens (deterministic, no chess.Board needed).
         Activity is taken from GameRecord if available, else defaults to 0.
@@ -76,9 +79,13 @@ class ReplayBuffer:
         total_plies = getattr(record, "total_plies", 0)
 
         for i, (board, policy) in enumerate(zip(record.positions, record.policies)):
-            # Even ply = white to move, odd ply = black to move
+            # Use actual ply to determine STM (handles PCR gaps correctly)
             # outcome is from white's perspective (+1 = white wins)
-            value = record.outcome if i % 2 == 0 else -record.outcome
+            if has_plies and i < len(record.plies):
+                ply = record.plies[i]
+            else:
+                ply = i  # Fallback: assume no gaps
+            value = record.outcome if ply % 2 == 0 else -record.outcome
 
             self.boards[self._index] = board
             self.policies[self._index] = policy

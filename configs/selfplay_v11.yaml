@@ -30,7 +30,7 @@ self_play:
   max_moves: 250                  # Compromise: PCR savings, but cap shuffle tails
   num_virtual_leaves: 8
   temperature_threshold: 30       # Explore moves 0-30, greedy after
-  dirichlet_epsilon: 0.0          # Disabled: Gumbel noise replaces Dirichlet
+  dirichlet_epsilon: 0.0          # Gumbel noise replaces Dirichlet (except first 10 ply, hardcoded)
   playout_cap_fraction: 0.25      # KataGo PCR: 25% full search, 75% fast (τ=0.5)
   fast_move_sims: 0               # Fast moves use raw policy (0 = no search)
   material_adjudication_threshold: 9.0  # Only adjudicate queen-up
@@ -44,6 +44,8 @@ training:
   buffer_size: 1000000
   decisive_boost: 1.0             # Uniform sampling — surprise weighting handles informativeness
   q_blend: 0.75                   # Value target: 75% MCTS root, 25% game outcome
+  sf_anchor_positions: 0            # Disabled: testing perspective flip hypothesis first
+  sf_anchor_depth: 8               # SF search depth for anchor evals (when enabled)
 
 # ── Evaluation ──────────────────────────────────────────────────────
 eval:
@@ -62,7 +64,7 @@ monitoring:
 checkpoint:
   save_every: 5
   checkpoint_dir: checkpoints/selfplay
-  resume: false                   # Fresh start — new architecture (per-head RPE, MLH)
+  resume: false                   # Fresh start — perspective canonicalization changes encoding
 
 # ── NCA Bootstrap ───────────────────────────────────────────────────
 nca:

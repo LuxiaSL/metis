@@ -23,7 +23,7 @@ import chess
 import numpy as np
 import torch
 
-from src.chess.board import BoardEncoder, MoveEncoder, POLICY_SIZE
+from src.chess.board import BoardEncoder, MoveEncoder, POLICY_SIZE, mirror_policy
 from src.chess.mcts_array import MCTSTree
 
 
@@ -638,13 +638,19 @@ class MCTS:
 
     @torch.no_grad()
     def _evaluate(self, board: chess.Board) -> tuple[np.ndarray, float]:
-        """Evaluate one position with the neural network."""
+        """Evaluate one position with the neural network.
+
+        Returns policy in actual-move space (unmirrored for black-to-move).
+        """
         encoded = BoardEncoder.encode_board(board).unsqueeze(0).to(self.device)
         self.model.eval()
         policy_logits, values = _extract_policy_and_value(self.model(encoded))
 
         policy = torch.softmax(policy_logits.squeeze(0).float(), dim=0).cpu().numpy()
         value = values.squeeze(0).item()
+        # Unmirror policy from model-space to actual-move space
+        if board.turn == chess.BLACK:
+            policy = mirror_policy(policy)
         return policy, value
 
     def search(self, board: chess.Board) -> dict[chess.Move, int]:
@@ -694,7 +700,10 @@ class BatchedMCTS:
     def _batched_evaluate(
         self, boards: list[chess.Board],
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Evaluate multiple positions in one forward pass."""
+        """Evaluate multiple positions in one forward pass.
+
+        Returns policies in actual-move space (unmirrored for black-to-move).
+        """
         if not boards:
             return np.empty((0, POLICY_SIZE)), np.empty(0)
 
@@ -703,6 +712,10 @@ class BatchedMCTS:
         policy_logits, values = _extract_policy_and_value(self.model(encoded))
 
         policies = torch.softmax(policy_logits.float(), dim=-1).cpu().numpy()
+        # Unmirror policies for black-to-move positions
+        for i, b in enumerate(boards):
+            if b.turn == chess.BLACK:
+                policies[i] = mirror_policy(policies[i])
         return policies, values.cpu().numpy()
 
     def search_batch(
