@@ -59,7 +59,7 @@ class GameRecord:
     positions: list[torch.Tensor] = field(default_factory=list)
     policies: list[torch.Tensor] = field(default_factory=list)
     activities: list[float] = field(default_factory=list)
-    root_values: list[float] = field(default_factory=list)  # MCTS root value per training move
+    root_wdl: list[list[float]] = field(default_factory=list)  # Full WDL probs per training move
     surprise: list[float] = field(default_factory=list)  # KL(improved || prior) per training move
     plies: list[int] = field(default_factory=list)  # actual ply when each training move was recorded
     total_plies: int = 0  # total game length (set at game end, for moves-left computation)
@@ -268,9 +268,10 @@ def _run_worker(
         return policies_np[slot_base:slot_base + count], values_np[slot_base:slot_base + count]
 
     use_gumbel = mcts_algorithm == "gumbel" and gumbel_config is not None
-    # Per-game storage for raw logits + root values (needed by Gumbel)
+    # Per-game storage for raw logits + root WDL (needed by Gumbel)
     root_logits: list[Optional[np.ndarray]] = [None] * num_games
-    root_values: list[float] = [0.0] * num_games
+    root_values: list[float] = [0.0] * num_games  # scalar for MCTS backup
+    root_wdl: list[Optional[np.ndarray]] = [None] * num_games  # full WDL for training targets
 
     def _expand_roots() -> None:
         """Expand root nodes for all active games via NN evaluation."""
@@ -278,11 +279,12 @@ def _run_worker(
         if not active_list:
             return
         boards_to_eval = [boards[i] for i in active_list]
-        logits_batch, values_batch = _request_eval(boards_to_eval)
+        logits_batch, wdl_batch = _request_eval(boards_to_eval)
         for j, i in enumerate(active_list):
-            # Store raw logits and value for Gumbel path
+            # Store raw logits and WDL for Gumbel path
             root_logits[i] = logits_batch[j].copy()
-            root_values[i] = float(values_batch[j])
+            root_wdl[i] = wdl_batch[j].copy()  # (3,) WDL probs
+            root_values[i] = float(wdl_batch[j][2] - wdl_batch[j][0])  # scalar for MCTS
             # Softmax for tree expansion priors
             probs = _softmax(logits_batch[j:j+1])[0]
             trees[i].expand(trees[i].root, boards[i], probs)
@@ -297,13 +299,14 @@ def _run_worker(
     def _eval_vl_batch(boards_to_eval: list) -> tuple[np.ndarray, np.ndarray]:
         """Evaluate a list of boards via the shared evaluator.
 
-        Returns (softmax_policies, values). Used by sequential_halving
+        Returns (softmax_policies, scalar_values). Used by sequential_halving
         with num_virtual_leaves > 1 for batched leaf evaluation.
         """
         if not boards_to_eval:
             return np.empty((0, POLICY_SIZE), dtype=np.float32), np.empty(0, dtype=np.float32)
-        logits_batch, values_batch = _request_eval(boards_to_eval)
-        return _softmax(logits_batch), values_batch
+        logits_batch, wdl_batch = _request_eval(boards_to_eval)
+        values = wdl_batch[:, 2] - wdl_batch[:, 0]  # WDL→scalar for MCTS backup
+        return _softmax(logits_batch), values
 
     # Track selected moves per game for tree reuse
     selected_moves: dict[int, Optional[chess.Move]] = {}
@@ -373,7 +376,7 @@ def _run_worker(
                     records[i].positions.append(BoardEncoder.encode_board(boards[i]))
                     records[i].policies.append(torch.from_numpy(improved_policy))
                     records[i].activities.append(_legal_move_count(boards[i]) / 40.0)
-                    records[i].root_values.append(root_values[i])
+                    records[i].root_wdl.append(root_wdl[i].tolist())
                     records[i].surprise.append(kl_div)
                     records[i].plies.append(ply)
 
@@ -536,10 +539,11 @@ def _run_worker(
         unexpanded = [i for i in active if not trees[i].is_expanded[trees[i].root]]
         if unexpanded:
             boards_to_eval = [boards[i] for i in unexpanded]
-            logits_batch, values_batch = _request_eval(boards_to_eval)
+            logits_batch, wdl_batch = _request_eval(boards_to_eval)
             for j, i in enumerate(unexpanded):
                 root_logits[i] = logits_batch[j].copy()
-                root_values[i] = float(values_batch[j])
+                root_wdl[i] = wdl_batch[j].copy()
+                root_values[i] = float(wdl_batch[j][2] - wdl_batch[j][0])
                 probs = _softmax(logits_batch[j:j+1])[0]
                 trees[i].expand(trees[i].root, boards[i], probs)
                 trees[i].add_dirichlet_noise(
@@ -553,7 +557,7 @@ def _run_worker(
             "positions": [p.numpy() for p in record.positions],
             "policies": [p.numpy() for p in record.policies],
             "activities": record.activities,
-            "root_values": record.root_values,
+            "root_wdl": record.root_wdl,
             "surprise": record.surprise,
             "plies": record.plies,
             "total_plies": record.total_plies,
@@ -826,21 +830,19 @@ class _DoubleBufferedEvaluator:
             # This enables Gumbel search which needs raw logits, and doesn't
             # hurt AlphaZero since expand() normalizes priors anyway.
             logits = policy_logits.float().cpu().numpy()
-            wdl_probs = torch.softmax(wdl_logits.float(), dim=-1)
-            values = (wdl_probs[:, 2] - wdl_probs[:, 0]).cpu().numpy()
-            return logits, values
+            wdl_probs = torch.softmax(wdl_logits.float(), dim=-1).cpu().numpy()
+            return logits, wdl_probs
 
         # Sub-batch fallback for very large batches
         all_logits: list[np.ndarray] = []
-        all_values: list[np.ndarray] = []
+        all_wdl: list[np.ndarray] = []
         for start in range(0, n, max_sub_batch):
             sub = board_tensor[start:start + max_sub_batch].to(self.device)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
                 policy_logits, wdl_logits, *_ = self.model(sub)
             all_logits.append(policy_logits.float().cpu().numpy())
-            wdl_probs = torch.softmax(wdl_logits.float(), dim=-1)
-            all_values.append((wdl_probs[:, 2] - wdl_probs[:, 0]).cpu().numpy())
-        return np.concatenate(all_logits), np.concatenate(all_values)
+            all_wdl.append(torch.softmax(wdl_logits.float(), dim=-1).cpu().numpy())
+        return np.concatenate(all_logits), np.concatenate(all_wdl)
 
 
 # ── Parallel self-play (production) ────────────────────────────────────────
@@ -892,7 +894,7 @@ class ParallelSelfPlay:
         max_pending = num_workers * SLOTS_PER_WORKER
         shared_boards = torch.zeros(max_pending, SEQ_LEN, dtype=torch.long).share_memory_()
         shared_policies = torch.zeros(max_pending, POLICY_SIZE, dtype=torch.float32).share_memory_()
-        shared_values = torch.zeros(max_pending, dtype=torch.float32).share_memory_()
+        shared_values = torch.zeros(max_pending, 3, dtype=torch.float32).share_memory_()  # WDL probs
 
         shm_mb = (
             shared_boards.numel() * shared_boards.element_size()
@@ -978,7 +980,7 @@ class ParallelSelfPlay:
                     positions=[torch.from_numpy(p) for p in payload["positions"]],
                     policies=[torch.from_numpy(p) for p in payload["policies"]],
                     activities=payload.get("activities", []),
-                    root_values=payload.get("root_values", []),
+                    root_wdl=payload.get("root_wdl", []),
                     surprise=payload.get("surprise", []),
                     plies=payload.get("plies", []),
                     total_plies=payload.get("total_plies", 0),
@@ -1080,7 +1082,7 @@ class SelfPlayWorker:
                 record.positions.append(BoardEncoder.encode_board(board))
                 record.policies.append(MoveEncoder.encode_policy(vc))
                 record.activities.append(_legal_move_count(board) / 40.0)
-                record.root_values.append(0.0)  # Single-process path: no root value available
+                record.root_wdl.append([1/3, 1/3, 1/3])  # Single-process path: uniform WDL fallback
                 record.surprise.append(0.0)  # No surprise data without Gumbel search
                 record.plies.append(ply_counts[game_idx])
 

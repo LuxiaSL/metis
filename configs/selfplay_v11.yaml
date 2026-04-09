@@ -27,7 +27,7 @@ self_play:
   gumbel_K: 16                    # Candidate actions at root
   gumbel_c_visit: 50.0            # Sigma scaling for completed Q-values
   games_per_iter: 512             # PCR saves ~75% search compute → more games
-  max_moves: 300                  # PCR makes longer games cheaper
+  max_moves: 250                  # Compromise: PCR savings, but cap shuffle tails
   num_virtual_leaves: 8
   temperature_threshold: 30       # Explore moves 0-30, greedy after
   dirichlet_epsilon: 0.0          # Disabled: Gumbel noise replaces Dirichlet
@@ -42,7 +42,7 @@ training:
   num_iterations: 200
   gradient_clip: 1.0
   buffer_size: 1000000
-  decisive_boost: 2.0             # PER: decisive positions sampled 2x
+  decisive_boost: 1.0             # Uniform sampling — surprise weighting handles informativeness
   q_blend: 0.75                   # Value target: 75% MCTS root, 25% game outcome
 
 # ── Evaluation ──────────────────────────────────────────────────────

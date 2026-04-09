@@ -499,7 +499,7 @@ def compute_loss(
     moves_left_pred: torch.Tensor,
     target_policy: torch.Tensor,
     target_value: torch.Tensor,
-    target_q_value: torch.Tensor,
+    target_q_wdl: torch.Tensor,
     target_material: torch.Tensor,
     target_activity: torch.Tensor,
     target_moves_left: torch.Tensor,
@@ -520,7 +520,7 @@ def compute_loss(
         moves_left_pred: (B, 1) predicted remaining game length.
         target_policy: (B, 4672) MCTS visit count distributions (sums to 1).
         target_value: (B,) z-targets — game outcomes {-1, 0, +1} from side-to-move.
-        target_q_value: (B,) q-targets — MCTS root values from side-to-move.
+        target_q_wdl: (B, 3) q-targets — full WDL probs from MCTS root.
         target_material: (B,) normalized material balance.
         target_activity: (B,) normalized legal move count.
         target_moves_left: (B,) normalized remaining game length.
@@ -539,11 +539,10 @@ def compute_loss(
     log_probs = F.log_softmax(policy_logits, dim=-1)
     per_sample_policy = -(target_policy * log_probs).sum(dim=-1)  # (B,)
 
-    # WDL value loss: blend z-target (game outcome) and q-target (MCTS root value)
+    # WDL value loss: blend z-target (game outcome) and q-target (MCTS root WDL)
     if q_blend > 0.0:
-        z_wdl = _scalar_to_soft_wdl(target_value)
-        q_wdl = _scalar_to_soft_wdl(target_q_value)
-        target_wdl = (1.0 - q_blend) * z_wdl + q_blend * q_wdl
+        z_wdl = _scalar_to_soft_wdl(target_value)     # (B, 3) from discrete {-1,0,+1}
+        target_wdl = (1.0 - q_blend) * z_wdl + q_blend * target_q_wdl  # (B, 3)
         wdl_log_probs = F.log_softmax(wdl_logits, dim=-1)
         per_sample_value = -(target_wdl * wdl_log_probs).sum(dim=-1)
     else:
@@ -944,7 +943,7 @@ def train(args: argparse.Namespace) -> None:
         surprise_sum = 0.0
 
         for step in range(num_train_steps):
-            boards, target_policies, target_values, target_q_values, target_materials, target_activities, surprises, target_moves_left = (
+            boards, target_policies, target_values, target_q_wdl, target_materials, target_activities, surprises, target_moves_left = (
                 replay_buffer.sample(args.batch_size)
             )
 
@@ -954,7 +953,7 @@ def train(args: argparse.Namespace) -> None:
             boards = boards.to(device)
             target_policies = target_policies.to(device)
             target_values = target_values.to(device)
-            target_q_values = target_q_values.to(device)
+            target_q_wdl = target_q_wdl.to(device)
             target_materials = target_materials.to(device)
             target_activities = target_activities.to(device)
             target_moves_left = target_moves_left.to(device)
@@ -972,7 +971,7 @@ def train(args: argparse.Namespace) -> None:
                 policy_logits, wdl_logits, material_pred, activity_pred, moves_left_pred = model(boards)
                 losses = compute_loss(
                     policy_logits, wdl_logits, material_pred, activity_pred, moves_left_pred,
-                    target_policies, target_values, target_q_values,
+                    target_policies, target_values, target_q_wdl,
                     target_materials, target_activities, target_moves_left,
                     z_loss_weight=config.z_loss_weight,
                     q_blend=args.q_blend,

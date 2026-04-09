@@ -31,7 +31,7 @@ class ReplayBuffer:
         self.boards = torch.zeros(capacity, SEQ_LEN, dtype=torch.long)
         self.policies = torch.zeros(capacity, POLICY_SIZE, dtype=torch.float32)
         self.values = torch.zeros(capacity, dtype=torch.float32)
-        self.q_values = torch.zeros(capacity, dtype=torch.float32)  # MCTS root value per position
+        self.q_wdl = torch.zeros(capacity, 3, dtype=torch.float32)  # Full WDL probs from MCTS root
         self.materials = torch.zeros(capacity, dtype=torch.float32)
         self.activities = torch.zeros(capacity, dtype=torch.float32)
         self.surprises = torch.ones(capacity, dtype=torch.float32)  # KL(improved || prior), default 1.0
@@ -70,7 +70,7 @@ class ReplayBuffer:
         Activity is taken from GameRecord if available, else defaults to 0.
         """
         has_activities = hasattr(record, "activities") and len(record.activities) > 0
-        has_root_values = hasattr(record, "root_values") and len(record.root_values) > 0
+        has_root_wdl = hasattr(record, "root_wdl") and len(record.root_wdl) > 0
         has_surprise = hasattr(record, "surprise") and len(record.surprise) > 0
         has_plies = hasattr(record, "plies") and len(record.plies) > 0
         total_plies = getattr(record, "total_plies", 0)
@@ -84,12 +84,15 @@ class ReplayBuffer:
             self.policies[self._index] = policy
             self.values[self._index] = value
 
-            # Q-value: MCTS root value (already from side-to-move perspective)
-            if has_root_values and i < len(record.root_values):
-                self.q_values[self._index] = record.root_values[i]
+            # Q-WDL: full WDL distribution from MCTS root
+            if has_root_wdl and i < len(record.root_wdl):
+                self.q_wdl[self._index] = torch.tensor(record.root_wdl[i], dtype=torch.float32)
             else:
-                # Fallback: use z-target when no root value available
-                self.q_values[self._index] = value
+                # Fallback: convert z-target to hard WDL
+                self.q_wdl[self._index] = torch.tensor(
+                    [max(0.0, -value), 1.0 - abs(value), max(0.0, value)],
+                    dtype=torch.float32,
+                )
 
             self.materials[self._index] = self._compute_material(board)
 
@@ -101,9 +104,10 @@ class ReplayBuffer:
             else:
                 self.surprises[self._index] = 1.0  # Default: no surprise weighting
 
-            # Moves-left: (total_plies - ply_at_position) / 150, normalized
+            # Moves-left: (total_plies - ply_at_position) / norm, clamped to [0, 1]
             if has_plies and i < len(record.plies) and total_plies > 0:
-                self.moves_left[self._index] = max(0, total_plies - record.plies[i]) / _MOVES_LEFT_NORM
+                raw = max(0, total_plies - record.plies[i]) / _MOVES_LEFT_NORM
+                self.moves_left[self._index] = min(raw, 1.0)
             else:
                 self.moves_left[self._index] = 0.0
 
@@ -123,7 +127,7 @@ class ReplayBuffer:
             boards: (B, 67) long tensor
             policies: (B, 4672) float tensor (probability distributions)
             values: (B,) float tensor — z-targets (game outcomes, side-to-move perspective)
-            q_values: (B,) float tensor — q-targets (MCTS root values)
+            q_wdl: (B, 3) float tensor — q-targets (full WDL probs from MCTS root)
             materials: (B,) float tensor (normalized material balance)
             activities: (B,) float tensor (normalized legal move count)
             surprises: (B,) float tensor — KL(improved || prior) per position
@@ -147,7 +151,7 @@ class ReplayBuffer:
             self.boards[indices],
             self.policies[indices],
             self.values[indices],
-            self.q_values[indices],
+            self.q_wdl[indices],
             self.materials[indices],
             self.activities[indices],
             self.surprises[indices],
@@ -170,7 +174,7 @@ class ReplayBuffer:
             "boards": self.boards[:n].clone(),
             "policies": self.policies[:n].to(torch.float16).clone(),
             "values": self.values[:n].clone(),
-            "q_values": self.q_values[:n].clone(),
+            "q_wdl": self.q_wdl[:n].clone(),
             "materials": self.materials[:n].clone(),
             "activities": self.activities[:n].clone(),
             "surprises": self.surprises[:n].clone(),
@@ -200,11 +204,20 @@ class ReplayBuffer:
             for i in range(n):
                 self.materials[i] = self._compute_material(self.boards[i])
 
-        if "q_values" in state:
-            self.q_values[:n] = state["q_values"]
+        if "q_wdl" in state:
+            self.q_wdl[:n] = state["q_wdl"]
+        elif "q_values" in state:
+            # Backward compat: older checkpoints had scalar q_values — convert to WDL
+            qv = state["q_values"]
+            self.q_wdl[:n, 0] = (-qv).clamp(min=0.0)   # p_loss
+            self.q_wdl[:n, 1] = (1.0 - qv.abs())        # p_draw
+            self.q_wdl[:n, 2] = qv.clamp(min=0.0)        # p_win
         else:
-            # Backward compat: older checkpoints have no q_values — use z-target as fallback
-            self.q_values[:n] = self.values[:n]
+            # No q data at all — use z-target converted to hard WDL
+            zv = self.values[:n]
+            self.q_wdl[:n, 0] = (-zv).clamp(min=0.0)
+            self.q_wdl[:n, 1] = (1.0 - zv.abs())
+            self.q_wdl[:n, 2] = zv.clamp(min=0.0)
 
         if "activities" in state:
             self.activities[:n] = state["activities"]
