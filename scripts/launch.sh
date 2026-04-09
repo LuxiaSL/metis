@@ -63,6 +63,7 @@ q_blend = get('training.q_blend', 0.0)
 
 # Self-play (continued)
 pcr_frac = get('self_play.playout_cap_fraction', 1.0)
+fast_move_sims = get('self_play.fast_move_sims', 0)
 mat_adj_thresh = get('self_play.material_adjudication_threshold', 9.0)
 
 # Eval
@@ -121,6 +122,8 @@ if float(q_blend) > 0.0:
     args.append(f'--q_blend {q_blend}')
 if float(pcr_frac) < 1.0:
     args.append(f'--playout_cap_fraction {pcr_frac}')
+if int(fast_move_sims) > 0:
+    args.append(f'--fast_move_sims {fast_move_sims}')
 args.append(f'--material_adjudication_threshold {mat_adj_thresh}')
 args.append(f'--eval_every {eval_every}')
 args.append(f'--eval_games_per_depth {eval_gpd}')

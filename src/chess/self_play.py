@@ -60,6 +60,7 @@ class GameRecord:
     policies: list[torch.Tensor] = field(default_factory=list)
     activities: list[float] = field(default_factory=list)
     root_values: list[float] = field(default_factory=list)  # MCTS root value per training move
+    surprise: list[float] = field(default_factory=list)  # KL(improved || prior) per training move
     outcome: float = 0.0
 
     def __len__(self) -> int:
@@ -88,6 +89,7 @@ class SelfPlayConfig:
 
     # Playout cap randomization (KataGo-style)
     playout_cap_fraction: float = 1.0  # 1.0 = disabled (all moves full search)
+    fast_move_sims: int = 0  # Sims for fast moves (0 = raw policy only)
     # Material adjudication threshold at max_moves
     material_adjudication_threshold: float = 3.0
 
@@ -182,6 +184,7 @@ def _worker_fn(
     gumbel_config: Optional[GumbelConfig] = None,
     playout_cap_fraction: float = 1.0,
     material_adjudication_threshold: float = 9.0,
+    fast_move_sims: int = 0,
 ) -> None:
     """Worker process: manages MCTS trees for assigned games (CPU only).
 
@@ -200,6 +203,7 @@ def _worker_fn(
             gumbel_config=gumbel_config,
             playout_cap_fraction=playout_cap_fraction,
             material_adjudication_threshold=material_adjudication_threshold,
+            fast_move_sims=fast_move_sims,
         )
     except Exception as e:
         logger.error("Worker %d crashed: %s", worker_id, e, exc_info=True)
@@ -224,6 +228,7 @@ def _run_worker(
     gumbel_config: Optional[GumbelConfig] = None,
     playout_cap_fraction: float = 1.0,
     material_adjudication_threshold: float = 9.0,
+    fast_move_sims: int = 0,
 ) -> None:
     """Core worker loop using shared memory for board/policy/value transfer."""
     # Numpy views of shared tensors (zero-copy, backed by /dev/shm)
@@ -350,11 +355,24 @@ def _run_worker(
                         logits_i, completed_q, legal_moves, sigma,
                     )
 
-                    # Record training data (position, improved policy, root value)
+                    # Compute policy surprise: KL(improved || prior) over legal moves
+                    legal_indices_arr = np.array(legal_indices, dtype=np.intp)
+                    prior_logits = logits_i[legal_indices_arr]
+                    prior_probs = _softmax(prior_logits[np.newaxis])[0]
+                    improved_legal = improved_policy[legal_indices_arr]
+                    # KL = sum(improved * log(improved / prior)) with epsilon for stability
+                    _eps = 1e-8
+                    kl_div = float(np.sum(
+                        improved_legal * np.log((improved_legal + _eps) / (prior_probs + _eps))
+                    ))
+                    kl_div = max(kl_div, 0.0)  # Clamp numerical noise
+
+                    # Record training data (position, improved policy, root value, surprise)
                     records[i].positions.append(BoardEncoder.encode_board(boards[i]))
                     records[i].policies.append(torch.from_numpy(improved_policy))
                     records[i].activities.append(_legal_move_count(boards[i]) / 40.0)
                     records[i].root_values.append(root_values[i])
+                    records[i].surprise.append(kl_div)
 
                     # Select move via Gumbel
                     if ply < temperature_threshold:
@@ -365,22 +383,59 @@ def _run_worker(
                     else:
                         move = winner
                 else:
-                    # ── Fast move: play from raw policy, no search, no recording ──
+                    # ── Fast move: no training data recorded ──
                     legal_indices = np.array(
                         [MoveEncoder.move_to_index(m) for m in legal_moves],
                         dtype=np.intp,
                     )
-                    legal_logits = logits_i[legal_indices]
 
-                    if ply < temperature_threshold:
-                        probs = _softmax(legal_logits[np.newaxis])[0]
+                    if fast_move_sims > 0:
+                        # Lightweight Gumbel search for better game progression
+                        K = min(gumbel_config.max_K, len(legal_moves))
+                        selected_indices, gumbel_scores = gumbel_top_k(
+                            logits_i, legal_indices.tolist(), K,
+                        )
+                        idx_to_move = {MoveEncoder.move_to_index(m): m for m in legal_moves}
+                        candidate_moves = [idx_to_move[si] for si in selected_indices]
+
+                        sequential_halving(
+                            trees[i], boards[i], candidate_moves,
+                            fast_move_sims, _eval_vl_batch,
+                            gumbel_config.cpuct,
+                            num_virtual_leaves=nvl,
+                        )
+
+                        completed_q = trees[i].get_completed_q_values(
+                            root_values[i], legal_moves,
+                        )
+                        sigma = compute_sigma(completed_q, gumbel_config.c_visit)
+
+                        if ply < temperature_threshold:
+                            q_values = trees[i].get_child_q_values(negate=True)
+                            move = select_gumbel_move(
+                                candidate_moves, gumbel_scores, q_values, sigma,
+                            )
+                        else:
+                            # After temperature threshold, pick best improved policy
+                            improved = compute_improved_policy(
+                                logits_i, completed_q, legal_moves, sigma,
+                            )
+                            # improved is 4672-dim; find which legal move has max probability
+                            best_policy_idx = int(np.argmax(improved[legal_indices]))
+                            move = legal_moves[best_policy_idx]
                     else:
-                        # Soft temperature (τ=0.5) instead of argmax to maintain
-                        # game diversity across fast moves in the 75% PCR path
-                        scaled = legal_logits * 2.0  # 1/τ = 1/0.5 = 2
-                        probs = _softmax(scaled[np.newaxis])[0]
-                    move_idx = np.random.choice(len(legal_moves), p=probs)
-                    move = legal_moves[move_idx]
+                        # Raw policy only (0 sims)
+                        legal_logits = logits_i[legal_indices]
+
+                        if ply < temperature_threshold:
+                            probs = _softmax(legal_logits[np.newaxis])[0]
+                        else:
+                            # Soft temperature (τ=0.5) instead of argmax to maintain
+                            # game diversity across fast moves in the 75% PCR path
+                            scaled = legal_logits * 2.0  # 1/τ = 1/0.5 = 2
+                            probs = _softmax(scaled[np.newaxis])[0]
+                        move_idx = np.random.choice(len(legal_moves), p=probs)
+                        move = legal_moves[move_idx]
 
                 boards[i].push(move)
                 ply_counts[i] += 1
@@ -492,6 +547,7 @@ def _run_worker(
             "policies": [p.numpy() for p in record.policies],
             "activities": record.activities,
             "root_values": record.root_values,
+            "surprise": record.surprise,
             "outcome": record.outcome,
         }
         game_result_queue.put(("game", worker_id, serialized))
@@ -879,6 +935,7 @@ class ParallelSelfPlay:
                     self.config.mcts_algorithm, gumbel_cfg,
                     self.config.playout_cap_fraction,
                     self.config.material_adjudication_threshold,
+                    self.config.fast_move_sims,
                 ),
                 daemon=True,
             )
@@ -913,6 +970,7 @@ class ParallelSelfPlay:
                     policies=[torch.from_numpy(p) for p in payload["policies"]],
                     activities=payload.get("activities", []),
                     root_values=payload.get("root_values", []),
+                    surprise=payload.get("surprise", []),
                     outcome=payload["outcome"],
                 )
                 completed_games.append(record)
@@ -1012,6 +1070,7 @@ class SelfPlayWorker:
                 record.policies.append(MoveEncoder.encode_policy(vc))
                 record.activities.append(_legal_move_count(board) / 40.0)
                 record.root_values.append(0.0)  # Single-process path: no root value available
+                record.surprise.append(0.0)  # No surprise data without Gumbel search
 
                 ply = ply_counts[game_idx]
                 temp = self.config.temperature if ply < self.config.temperature_threshold else 0.0

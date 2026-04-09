@@ -1,7 +1,8 @@
 """Circular experience replay buffer for self-play training data.
 
-Stores (board_encoding, policy_target, value_target, material_target, activity_target)
-tuples from self-play games. Supports uniform random sampling for training batches.
+Stores (board_encoding, policy_target, value_target, q_value_target,
+material_target, activity_target, surprise) tuples from self-play games.
+Supports weighted sampling (PER decisive_boost) for training batches.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ class ReplayBuffer:
         self.q_values = torch.zeros(capacity, dtype=torch.float32)  # MCTS root value per position
         self.materials = torch.zeros(capacity, dtype=torch.float32)
         self.activities = torch.zeros(capacity, dtype=torch.float32)
+        self.surprises = torch.ones(capacity, dtype=torch.float32)  # KL(improved || prior), default 1.0
         self.weights = torch.ones(capacity, dtype=torch.float32)
         self._index: int = 0
         self._size: int = 0
@@ -67,6 +69,7 @@ class ReplayBuffer:
         """
         has_activities = hasattr(record, "activities") and len(record.activities) > 0
         has_root_values = hasattr(record, "root_values") and len(record.root_values) > 0
+        has_surprise = hasattr(record, "surprise") and len(record.surprise) > 0
 
         for i, (board, policy) in enumerate(zip(record.positions, record.policies)):
             # Even ply = white to move, odd ply = black to move
@@ -89,6 +92,11 @@ class ReplayBuffer:
             if has_activities and i < len(record.activities):
                 self.activities[self._index] = record.activities[i]
 
+            if has_surprise and i < len(record.surprise):
+                self.surprises[self._index] = record.surprise[i]
+            else:
+                self.surprises[self._index] = 1.0  # Default: no surprise weighting
+
             # PER: decisive positions (win/loss) get higher sampling weight
             weight = self.decisive_boost if abs(record.outcome) > 0.5 else 1.0
             self.weights[self._index] = weight
@@ -98,7 +106,7 @@ class ReplayBuffer:
 
     def sample(
         self, batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample a random batch of training examples.
 
         Returns:
@@ -108,6 +116,7 @@ class ReplayBuffer:
             q_values: (B,) float tensor — q-targets (MCTS root values)
             materials: (B,) float tensor (normalized material balance)
             activities: (B,) float tensor (normalized legal move count)
+            surprises: (B,) float tensor — KL(improved || prior) per position
 
         Raises:
             ValueError: If buffer has fewer samples than batch_size.
@@ -130,6 +139,7 @@ class ReplayBuffer:
             self.q_values[indices],
             self.materials[indices],
             self.activities[indices],
+            self.surprises[indices],
         )
 
     def clear(self) -> None:
@@ -151,6 +161,7 @@ class ReplayBuffer:
             "q_values": self.q_values[:n].clone(),
             "materials": self.materials[:n].clone(),
             "activities": self.activities[:n].clone(),
+            "surprises": self.surprises[:n].clone(),
             "weights": self.weights[:n].clone(),
             "index": self._index,
             "size": self._size,
@@ -185,6 +196,10 @@ class ReplayBuffer:
         if "activities" in state:
             self.activities[:n] = state["activities"]
         # else: activities stay at 0 (no way to recompute without chess.Board)
+
+        if "surprises" in state:
+            self.surprises[:n] = state["surprises"]
+        # else: surprises stay at 1.0 (uniform — backward compatible)
 
         if "weights" in state:
             self.weights[:n] = state["weights"]

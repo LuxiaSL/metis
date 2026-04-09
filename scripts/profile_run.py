@@ -340,7 +340,7 @@ def profile_training_steps(
             torch.cuda.synchronize(device)
             t0 = time.monotonic()
 
-            boards, policies, values, materials, activities = replay_buffer.sample(
+            boards, policies, values, _q_values, materials, activities, _surprises = replay_buffer.sample(
                 batch_size
             )
             boards = boards.to(device)

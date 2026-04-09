@@ -467,7 +467,7 @@ def test_per_weighting():
     decisive_count = 0
     total_samples = 0
     for _ in range(100):
-        _, _, values, _, _ = buf.sample(64)
+        _, _, values, *_ = buf.sample(64)
         decisive_count += (values.abs() > 0.5).sum().item()
         total_samples += 64
 
@@ -496,7 +496,7 @@ def test_per_disabled():
     decisive_count = 0
     total_samples = 0
     for _ in range(100):
-        _, _, values, _, _ = buf.sample(64)
+        _, _, values, *_ = buf.sample(64)
         decisive_count += (values.abs() > 0.5).sum().item()
         total_samples += 64
 
