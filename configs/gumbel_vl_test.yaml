@@ -1,0 +1,47 @@
+# Test: Gumbel with per-worker VL batching (no cross-game sync)
+# Matches original v10 settings except uses VL-enabled sequential_halving
+# Comparing against job 511ef5 (41.7/batch, 2300 evals/s)
+
+model:
+  size: medium
+  attn_res_boundaries: "0,1,3,9"
+  activation_checkpointing: false
+  compile: true
+
+self_play:
+  num_workers: 96                 # Same as original v10
+  num_parallel_games: 256         # Same as original v10
+  mcts_algorithm: gumbel
+  mcts_simulations: 200
+  gumbel_K: 16
+  gumbel_c_visit: 50.0
+  games_per_iter: 256             # Same as original v10
+  max_moves: 200
+  num_virtual_leaves: 8           # VL batching within sequential halving
+  temperature_threshold: 30
+  dirichlet_epsilon: 0.0
+
+training:
+  batch_size: 1024
+  train_steps_per_iter: 20
+  gradient_clip: 1.0
+  buffer_size: 1000000
+  decisive_boost: 4.0
+
+eval:
+  eval_every: 0
+
+monitoring:
+  monitor: false
+
+checkpoint:
+  save_every: 0
+  checkpoint_dir: checkpoints/selfplay
+  resume: true
+
+nca:
+  nca_bootstrap: false
+
+infra:
+  stockfish_path: ~/luxi-files/bin/stockfish
+  wandb: false

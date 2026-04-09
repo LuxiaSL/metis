@@ -471,6 +471,26 @@ def is_main_process() -> bool:
 # ── Loss computation ──────────────────────────────────────────────────────
 
 
+def _scalar_to_soft_wdl(v: torch.Tensor) -> torch.Tensor:
+    """Convert scalar value in [-1, 1] to soft WDL distribution.
+
+    Maps v to (p_loss, p_draw, p_win) where:
+        p_win  = max(0, v)
+        p_loss = max(0, -v)
+        p_draw = 1 - |v|
+
+    Args:
+        v: (B,) scalar values in [-1, 1].
+
+    Returns:
+        (B, 3) soft WDL distributions [loss, draw, win].
+    """
+    p_win = v.clamp(min=0.0)
+    p_loss = (-v).clamp(min=0.0)
+    p_draw = (1.0 - v.abs()).clamp(min=0.0)
+    return torch.stack([p_loss, p_draw, p_win], dim=-1)
+
+
 def compute_loss(
     policy_logits: torch.Tensor,
     wdl_logits: torch.Tensor,
@@ -478,11 +498,13 @@ def compute_loss(
     activity_pred: torch.Tensor,
     target_policy: torch.Tensor,
     target_value: torch.Tensor,
+    target_q_value: torch.Tensor,
     target_material: torch.Tensor,
     target_activity: torch.Tensor,
     z_loss_weight: float = 1e-5,
     material_loss_weight: float = 0.1,
     activity_loss_weight: float = 0.05,
+    q_blend: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Compute training loss with WDL value head and auxiliary targets.
 
@@ -492,12 +514,14 @@ def compute_loss(
         material_pred: (B, 1) predicted material balance.
         activity_pred: (B, 1) predicted legal move count.
         target_policy: (B, 4672) MCTS visit count distributions (sums to 1).
-        target_value: (B,) game outcomes {-1, 0, +1} from side-to-move perspective.
+        target_value: (B,) z-targets — game outcomes {-1, 0, +1} from side-to-move.
+        target_q_value: (B,) q-targets — MCTS root values from side-to-move.
         target_material: (B,) normalized material balance.
         target_activity: (B,) normalized legal move count.
         z_loss_weight: z-loss coefficient for policy logit regularization.
         material_loss_weight: weight for material prediction auxiliary loss.
         activity_loss_weight: weight for activity prediction auxiliary loss.
+        q_blend: blend factor for value target — 0.0 = pure z, 1.0 = pure q.
 
     Returns:
         Dict with 'loss', 'policy_loss', 'value_loss', 'z_loss',
@@ -507,9 +531,19 @@ def compute_loss(
     log_probs = F.log_softmax(policy_logits, dim=-1)
     policy_loss = -(target_policy * log_probs).sum(dim=-1).mean()
 
-    # WDL value loss: cross-entropy with 3 classes {0=loss, 1=draw, 2=win}
-    target_class = (target_value + 1).long()  # {-1,0,+1} → {0,1,2}
-    value_loss = F.cross_entropy(wdl_logits, target_class)
+    # WDL value loss: blend z-target (game outcome) and q-target (MCTS root value)
+    # as soft WDL distributions, then use soft cross-entropy.
+    if q_blend > 0.0:
+        z_wdl = _scalar_to_soft_wdl(target_value)     # (B, 3) hard-ish from {-1,0,+1}
+        q_wdl = _scalar_to_soft_wdl(target_q_value)    # (B, 3) soft from continuous [-1,1]
+        target_wdl = (1.0 - q_blend) * z_wdl + q_blend * q_wdl
+        # Soft cross-entropy: -(target * log_softmax(logits)).sum(-1).mean()
+        wdl_log_probs = F.log_softmax(wdl_logits, dim=-1)
+        value_loss = -(target_wdl * wdl_log_probs).sum(dim=-1).mean()
+    else:
+        # Pure z-target: standard hard cross-entropy
+        target_class = (target_value + 1).long()  # {-1,0,+1} → {0,1,2}
+        value_loss = F.cross_entropy(wdl_logits, target_class)
 
     # z-loss: prevent policy logit explosion (from luxia-base)
     log_z = torch.logsumexp(policy_logits, dim=-1)
@@ -596,12 +630,26 @@ def train(args: argparse.Namespace) -> None:
             import wandb
             if args.wandb_api_key:
                 os.environ["WANDB_API_KEY"] = args.wandb_api_key
+            # Use a deterministic run ID derived from wandb_name so that
+            # resumed runs append to the same wandb run instead of creating
+            # a new one (which resets the step counter).
+            _wandb_id = args.wandb_name or "metis"
             wandb_run = wandb.init(
                 entity=args.wandb_entity,
                 project=args.wandb_project,
                 name=args.wandb_name,
+                id=_wandb_id,
+                resume="allow",
                 config=vars(args),
             )
+            # Use iteration as x-axis for all training metrics
+            wandb.define_metric("iteration")
+            wandb.define_metric("train/*", step_metric="iteration")
+            wandb.define_metric("selfplay/*", step_metric="iteration")
+            wandb.define_metric("cumulative/*", step_metric="iteration")
+            wandb.define_metric("time/*", step_metric="iteration")
+            wandb.define_metric("eval/*", step_metric="iteration")
+            wandb.define_metric("geo/*", step_metric="iteration")
         except Exception as e:
             logger.warning("Wandb init failed: %s", e)
 
@@ -672,6 +720,8 @@ def train(args: argparse.Namespace) -> None:
         mcts_algorithm=args.mcts_algorithm,
         gumbel_K=args.gumbel_K,
         gumbel_c_visit=args.gumbel_c_visit,
+        playout_cap_fraction=args.playout_cap_fraction,
+        material_adjudication_threshold=args.material_adjudication_threshold,
     )
 
     # Use multiprocessing when >1 worker, fallback to single-process.
@@ -756,6 +806,14 @@ def train(args: argparse.Namespace) -> None:
     # ── Main training loop ────────────────────────────────────────────
     global_train_step = start_iteration * args.train_steps_per_iter
 
+    # Cumulative counters (across all iterations in this run)
+    cumul_games = 0
+    cumul_positions = 0
+    cumul_evals = 0
+    # Rolling window for win rate trend (last 5 iterations)
+    recent_win_rates: list[float] = []
+    _WIN_RATE_WINDOW = 5
+
     for iteration in range(start_iteration, args.num_iterations):
         iter_start = time.time()
         iter_log_dict: dict[str, float] = {}
@@ -799,12 +857,34 @@ def train(args: argparse.Namespace) -> None:
         for game in games:
             replay_buffer.add_game(game)
 
+        # Accumulate cumulative counters
+        n_games = len(games)
+        cumul_games += n_games
+        cumul_positions += total_positions
+        # Estimate evals from positions (each position = 1 NN eval during MCTS)
+        iter_evals = total_positions * args.mcts_simulations
+        cumul_evals += iter_evals
+
+        # Win rate tracking
+        win_rate = (outcomes["white"] + outcomes["black"]) / max(n_games, 1)
+        recent_win_rates.append(win_rate)
+        if len(recent_win_rates) > _WIN_RATE_WINDOW:
+            recent_win_rates.pop(0)
+        avg_win_rate = sum(recent_win_rates) / len(recent_win_rates)
+
         if is_main_process():
+            evals_per_sec = iter_evals / max(selfplay_time, 1e-6)
             logger.info(
-                "Generated %d games, %d positions (avg %.0f moves, W/B/D=%d/%d/%d) in %.1fs (buffer: %d)",
-                len(games), total_positions, avg_game_len,
+                "Iter %d self-play: %d games (%d total) | %d pos (%d total) | "
+                "avg %.0f moves | W/B/D=%d/%d/%d (win%%=%.0f%%, trend=%.0f%%) | "
+                "%.1fs (%.0f evals/s) | buffer: %d",
+                iteration, n_games, cumul_games,
+                total_positions, cumul_positions,
+                avg_game_len,
                 outcomes["white"], outcomes["black"], outcomes["draw"],
-                selfplay_time, len(replay_buffer),
+                win_rate * 100, avg_win_rate * 100,
+                selfplay_time, evals_per_sec,
+                len(replay_buffer),
             )
 
         # Set probe batch for monitoring (once, from first generation)
@@ -839,13 +919,20 @@ def train(args: argparse.Namespace) -> None:
         else:
             num_train_steps = args.train_steps_per_iter
 
+        decisive_frac_sum = 0.0
+
         for step in range(num_train_steps):
-            boards, target_policies, target_values, target_materials, target_activities = (
+            boards, target_policies, target_values, target_q_values, target_materials, target_activities = (
                 replay_buffer.sample(args.batch_size)
             )
+
+            # Track PER effectiveness: fraction of batch that's decisive
+            decisive_frac_sum += (target_values.abs() > 0.5).float().mean().item()
+
             boards = boards.to(device)
             target_policies = target_policies.to(device)
             target_values = target_values.to(device)
+            target_q_values = target_q_values.to(device)
             target_materials = target_materials.to(device)
             target_activities = target_activities.to(device)
 
@@ -853,8 +940,10 @@ def train(args: argparse.Namespace) -> None:
                 policy_logits, wdl_logits, material_pred, activity_pred = model(boards)
                 losses = compute_loss(
                     policy_logits, wdl_logits, material_pred, activity_pred,
-                    target_policies, target_values, target_materials, target_activities,
+                    target_policies, target_values, target_q_values,
+                    target_materials, target_activities,
                     z_loss_weight=config.z_loss_weight,
+                    q_blend=args.q_blend,
                 )
 
             losses["loss"].backward()
@@ -882,6 +971,7 @@ def train(args: argparse.Namespace) -> None:
         for k in train_metrics:
             train_metrics[k] /= num_steps
         avg_grad_norm = grad_norm_sum / num_steps
+        avg_decisive_frac = decisive_frac_sum / num_steps
         train_time = time.time() - train_start
 
         iter_time = time.time() - iter_start
@@ -889,19 +979,21 @@ def train(args: argparse.Namespace) -> None:
         # ── Logging ───────────────────────────────────────────────
         if is_main_process():
             lrs = scheduler.get_last_lr()
+            draw_rate = outcomes["draw"] / max(len(games), 1)
             logger.info(
-                "Iter %d: loss=%.4f (policy=%.4f value=%.4f z=%.6f mat=%.4f act=%.4f) "
-                "lr_muon=%.2e lr_adam=%.2e grad=%.2f time=%.1fs",
+                "Iter %d train [step %d]: loss=%.4f (pol=%.4f val=%.4f z=%.6f mat=%.4f act=%.4f) "
+                "grad=%.2f decisive=%.0f%% | %.1fs (%.0fs total)",
                 iteration,
+                global_train_step,
                 train_metrics["loss"],
                 train_metrics["policy_loss"],
                 train_metrics["value_loss"],
                 train_metrics["z_loss"],
                 train_metrics["material_loss"],
                 train_metrics["activity_loss"],
-                lrs["muon_lr"],
-                lrs["adamw_lr"],
                 grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                avg_decisive_frac * 100,
+                train_time,
                 iter_time,
             )
 
@@ -914,22 +1006,33 @@ def train(args: argparse.Namespace) -> None:
                     "train/muon_lr": lrs["muon_lr"],
                     "train/adamw_lr": lrs["adamw_lr"],
                     "train/buffer_size": len(replay_buffer),
+                    "train/global_step": global_train_step,
                     # Timing
                     "time/iter_total": iter_time,
                     "time/selfplay": selfplay_time,
                     "time/training": train_time,
                     "time/selfplay_pct": selfplay_time / max(iter_time, 1e-6) * 100,
-                    # Game stats
+                    # Game stats (per iteration)
                     "selfplay/positions": total_positions,
-                    "selfplay/games": len(games),
+                    "selfplay/games": n_games,
                     "selfplay/avg_game_length": avg_game_len,
                     "selfplay/white_wins": outcomes["white"],
                     "selfplay/black_wins": outcomes["black"],
                     "selfplay/draws": outcomes["draw"],
+                    "selfplay/draw_rate": draw_rate,
+                    "selfplay/win_rate": win_rate,
+                    "selfplay/win_rate_trend": avg_win_rate,
                     "selfplay/positions_per_sec": total_positions / max(selfplay_time, 1e-6),
+                    "selfplay/evals_per_sec": iter_evals / max(selfplay_time, 1e-6),
+                    # Cumulative totals
+                    "cumulative/games": cumul_games,
+                    "cumulative/positions": cumul_positions,
+                    "cumulative/evals": cumul_evals,
                     # Training throughput
                     "train/steps_per_sec": num_steps / max(train_time, 1e-6),
                     "train/num_steps": num_steps,
+                    # PER / signal quality
+                    "train/decisive_frac": avg_decisive_frac,
                 })
                 # Don't log yet — accumulate all metrics for this iteration
                 iter_log_dict = log_dict
@@ -971,6 +1074,7 @@ def train(args: argparse.Namespace) -> None:
         # ── Flush all metrics for this iteration to wandb ─────────
         if wandb_run is not None and is_main_process():
             if iter_log_dict:
+                iter_log_dict["iteration"] = iteration
                 wandb_run.log(iter_log_dict, commit=True)
                 logger.debug("Logged %d metrics to wandb (iter %d)", len(iter_log_dict), iteration)
 
@@ -1060,7 +1164,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient_clip", type=float, default=1.0)
     parser.add_argument("--buffer_size", type=int, default=1_000_000)
     parser.add_argument("--decisive_boost", type=float, default=1.0,
-                        help="PER sampling weight for decisive positions (1.0=uniform, 4.0=recommended)")
+                        help="PER sampling weight for decisive positions (1.0=uniform, 2.0=recommended)")
+    parser.add_argument("--q_blend", type=float, default=0.0,
+                        help="Blend factor for value target: 0.0=pure z (game outcome), 0.75=mostly q (MCTS root)")
+    parser.add_argument("--playout_cap_fraction", type=float, default=1.0,
+                        help="Fraction of moves that get full search (1.0=all, 0.25=KataGo-style PCR)")
+    parser.add_argument("--material_adjudication_threshold", type=float, default=9.0,
+                        help="Material diff for win/loss adjudication at max_moves (9.0=queen, 3.0=old default)")
 
     # Optimizer
     parser.add_argument("--muon_lr", type=float, default=0.02)

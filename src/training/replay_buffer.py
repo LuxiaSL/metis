@@ -29,6 +29,7 @@ class ReplayBuffer:
         self.boards = torch.zeros(capacity, SEQ_LEN, dtype=torch.long)
         self.policies = torch.zeros(capacity, POLICY_SIZE, dtype=torch.float32)
         self.values = torch.zeros(capacity, dtype=torch.float32)
+        self.q_values = torch.zeros(capacity, dtype=torch.float32)  # MCTS root value per position
         self.materials = torch.zeros(capacity, dtype=torch.float32)
         self.activities = torch.zeros(capacity, dtype=torch.float32)
         self.weights = torch.ones(capacity, dtype=torch.float32)
@@ -55,14 +56,17 @@ class ReplayBuffer:
     def add_game(self, record: GameRecord) -> None:
         """Add all positions from a completed game.
 
-        Values are stored from the perspective of the side to move at each
-        position. White positions get outcome directly; black positions get
-        -outcome (since outcome is from white's perspective).
+        Values (z-targets) are stored from the perspective of the side to move.
+        White positions get outcome directly; black positions get -outcome.
+        Q-values (MCTS root values) are also stored per position for blended
+        value targets. With PCR, only training moves have positions recorded,
+        so the ply index tracks position order (not absolute game ply).
 
         Material is computed from board tokens (deterministic, no chess.Board needed).
         Activity is taken from GameRecord if available, else defaults to 0.
         """
         has_activities = hasattr(record, "activities") and len(record.activities) > 0
+        has_root_values = hasattr(record, "root_values") and len(record.root_values) > 0
 
         for i, (board, policy) in enumerate(zip(record.positions, record.policies)):
             # Even ply = white to move, odd ply = black to move
@@ -72,6 +76,14 @@ class ReplayBuffer:
             self.boards[self._index] = board
             self.policies[self._index] = policy
             self.values[self._index] = value
+
+            # Q-value: MCTS root value (already from side-to-move perspective)
+            if has_root_values and i < len(record.root_values):
+                self.q_values[self._index] = record.root_values[i]
+            else:
+                # Fallback: use z-target when no root value available
+                self.q_values[self._index] = value
+
             self.materials[self._index] = self._compute_material(board)
 
             if has_activities and i < len(record.activities):
@@ -86,13 +98,14 @@ class ReplayBuffer:
 
     def sample(
         self, batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample a random batch of training examples.
 
         Returns:
             boards: (B, 67) long tensor
             policies: (B, 4672) float tensor (probability distributions)
-            values: (B,) float tensor (game outcomes from side-to-move perspective)
+            values: (B,) float tensor — z-targets (game outcomes, side-to-move perspective)
+            q_values: (B,) float tensor — q-targets (MCTS root values)
             materials: (B,) float tensor (normalized material balance)
             activities: (B,) float tensor (normalized legal move count)
 
@@ -114,6 +127,7 @@ class ReplayBuffer:
             self.boards[indices],
             self.policies[indices],
             self.values[indices],
+            self.q_values[indices],
             self.materials[indices],
             self.activities[indices],
         )
@@ -134,6 +148,7 @@ class ReplayBuffer:
             "boards": self.boards[:n].clone(),
             "policies": self.policies[:n].to(torch.float16).clone(),
             "values": self.values[:n].clone(),
+            "q_values": self.q_values[:n].clone(),
             "materials": self.materials[:n].clone(),
             "activities": self.activities[:n].clone(),
             "weights": self.weights[:n].clone(),
@@ -160,6 +175,12 @@ class ReplayBuffer:
             # Recompute material from board tokens
             for i in range(n):
                 self.materials[i] = self._compute_material(self.boards[i])
+
+        if "q_values" in state:
+            self.q_values[:n] = state["q_values"]
+        else:
+            # Backward compat: older checkpoints have no q_values — use z-target as fallback
+            self.q_values[:n] = self.values[:n]
 
         if "activities" in state:
             self.activities[:n] = state["activities"]

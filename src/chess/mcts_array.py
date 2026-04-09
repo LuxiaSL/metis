@@ -359,6 +359,49 @@ class MCTSTree:
             node = child
         return node, search_board
 
+    def find_leaf_in_subtree_vl(
+        self, child_idx: int, board: chess.Board, cpuct: float, vl: float = 1.0,
+    ) -> tuple[int, chess.Board, np.ndarray]:
+        """Find a leaf in a subtree WITH virtual loss for parallel leaf finding.
+
+        Like find_leaf_with_virtual_loss but starting from a specific child
+        node instead of root. Used by batched Sequential Halving.
+
+        Args:
+            child_idx: Start node (a child of root, already expanded).
+            board: Board state with the root→child move already applied.
+            cpuct: PUCT exploration constant.
+            vl: Virtual loss value.
+
+        Returns:
+            (leaf_idx, leaf_board, path) where path contains node indices
+            with virtual loss applied.
+        """
+        path_len = _find_leaf_jit(
+            child_idx,
+            self.children_start, self.num_children,
+            self.visit_count, self.value_sum, self.prior,
+            self.is_expanded, self.is_terminal,
+            cpuct, vl, self._path_buf,
+        )
+        path = self._path_buf[:path_len].copy()
+        leaf = int(path[-1]) if path_len > 0 else child_idx
+
+        search_board = board.copy(stack=False)
+        if isinstance(search_board, BitboardBoard):
+            for i in range(path_len):
+                node = int(path[i])
+                from_sq = int(self.move_from_sq[node])
+                to_sq = int(self.move_to_sq[node])
+                promo = int(self.move_promo[node])
+                search_board.push(from_sq | (to_sq << 6) | (promo << 12))
+        else:
+            for i in range(path_len):
+                node = int(path[i])
+                search_board.push(self.get_child_move(node))
+
+        return leaf, search_board, path
+
     def remove_virtual_loss(self, path: np.ndarray, vl: float = 1.0) -> None:
         if len(path) > 0:
             _remove_vl_jit(path, len(path), self.visit_count, self.value_sum, vl)

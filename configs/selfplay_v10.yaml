@@ -1,0 +1,77 @@
+# Metis self-play training — v10.1 "Athena" (2026-04-08)
+# Key changes from v10:
+#   - Per-head relative position bias (enables rook/bishop/knight head specialization)
+#   - Q-target blending (75% MCTS root value + 25% game outcome) — breaks draw basin
+#   - Playout cap randomization: 25% full search, 75% fast (KataGo-style)
+#   - Material adjudication threshold 3 → 9 (only adjudicate queen-up positions)
+#   - PER decisive_boost 4.0 → 2.0 (lighter bias)
+#   - max_moves 200 → 300 (PCR makes longer games cheaper)
+#   - games_per_iter 256 → 512 (PCR saves ~75% search compute → more games)
+#
+# Use with: bash scripts/launch.sh configs/selfplay_v10.yaml
+
+# ── Model ───────────────────────────────────────────────────────────
+model:
+  size: medium                    # 36M params, D=512, 12 layers
+  attn_res_boundaries: "0,1,3,9" # Block boundaries: [1, 2, 6, 3] layers
+  activation_checkpointing: false # Full B200: no need
+  compile: true                   # torch.compile (~44% inference speedup)
+
+# ── Self-play ───────────────────────────────────────────────────────
+self_play:
+  num_workers: 96                 # 96 of 128 cores — per-worker VL batching → ~680/batch
+  num_parallel_games: 256         # 96 workers × 2-3 games each
+  mcts_algorithm: gumbel          # Gumbel AlphaZero (Sequential Halving + VL batching)
+  mcts_simulations: 200           # Down from 800: Gumbel is more efficient per-sim
+  gumbel_K: 16                    # Candidate actions at root
+  gumbel_c_visit: 50.0            # Sigma scaling for completed Q-values
+  games_per_iter: 512             # Up from 256: PCR saves ~75% search compute
+  max_moves: 300                  # Up from 200: PCR makes longer games cheaper
+  num_virtual_leaves: 8
+  temperature_threshold: 30       # Explore moves 0-30, greedy after
+  dirichlet_epsilon: 0.0          # Disabled: Gumbel noise replaces Dirichlet
+  playout_cap_fraction: 0.25      # KataGo PCR: 25% full search, 75% fast play
+  material_adjudication_threshold: 9.0  # Only adjudicate queen-up (was 3.0)
+
+# ── Training ────────────────────────────────────────────────────────
+training:
+  batch_size: 4096
+  train_steps_per_iter: 1000
+  num_iterations: 200
+  gradient_clip: 1.0
+  buffer_size: 1000000
+  decisive_boost: 2.0             # PER: decisive positions sampled 2x (was 4x)
+  q_blend: 0.75                   # Value target: 75% MCTS root value, 25% game outcome
+
+# ── Evaluation ──────────────────────────────────────────────────────
+eval:
+  eval_every: 5
+  eval_games_per_depth: 20
+  eval_mcts_sims: 400
+  eval_depths: "1,3,5"
+
+# ── Monitoring ──────────────────────────────────────────────────────
+monitoring:
+  monitor: true
+  monitor_tier1_every: 500
+  monitor_tier2_every: 5000
+
+# ── Checkpointing ──────────────────────────────────────────────────
+checkpoint:
+  save_every: 5
+  checkpoint_dir: checkpoints/selfplay
+  resume: true                    # Resume from iter 1 checkpoint
+
+# ── NCA Bootstrap ───────────────────────────────────────────────────
+nca:
+  nca_bootstrap: true
+
+# ── Infrastructure ──────────────────────────────────────────────────
+infra:
+  node: node1
+  gpu: 7
+  stockfish_path: ~/luxi-files/bin/stockfish
+  wandb: true
+  wandb_entity: aethera
+  wandb_project: metis
+  wandb_name: metis-athena-v10

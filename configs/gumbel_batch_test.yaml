@@ -1,0 +1,49 @@
+# Quick A/B test: Gumbel batching efficiency at different worker counts.
+# Tests whether fewer workers with more games/worker improves batch sizes.
+#
+# Usage: CUDA_VISIBLE_DEVICES=1 python scripts/profile_run.py --config configs/gumbel_batch_test.yaml
+
+model:
+  size: medium
+  attn_res_boundaries: "0,1,3,9"
+  activation_checkpointing: false
+  compile: true
+
+self_play:
+  # TEST: 96 workers × ~5 games each — uses 3/4 of node2's 128 cores
+  num_workers: 96
+  num_parallel_games: 512        # 96 workers × ~5 games each
+  mcts_algorithm: gumbel
+  mcts_simulations: 200
+  gumbel_K: 16
+  gumbel_c_visit: 50.0
+  games_per_iter: 512            # 96 workers × ~5 games each
+  max_moves: 200
+  num_virtual_leaves: 8
+  temperature_threshold: 30
+  dirichlet_epsilon: 0.0
+
+training:
+  batch_size: 1024               # Smaller for quick profiling
+  train_steps_per_iter: 20
+  gradient_clip: 1.0
+  buffer_size: 1000000
+  decisive_boost: 4.0
+
+eval:
+  eval_every: 0
+
+monitoring:
+  monitor: false
+
+checkpoint:
+  save_every: 0
+  checkpoint_dir: checkpoints/selfplay
+  resume: true                   # Load current checkpoint for realistic model
+
+nca:
+  nca_bootstrap: false
+
+infra:
+  stockfish_path: ~/luxi-files/bin/stockfish
+  wandb: false

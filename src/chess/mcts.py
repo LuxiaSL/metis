@@ -345,16 +345,23 @@ def sequential_halving(
     num_simulations: int,
     eval_fn,
     cpuct: float = 1.25,
+    num_virtual_leaves: int = 1,
 ) -> chess.Move:
     """Allocate simulations via Sequential Halving, return winner.
+
+    Uses virtual leaves to batch multiple leaf evaluations per eval call,
+    reducing round-trip overhead while keeping per-game independence
+    (no cross-game synchronization).
 
     Args:
         tree: MCTS tree with root already expanded.
         board: Board at root position.
         candidate_moves: K moves from Gumbel-Top-K.
         num_simulations: Total simulation budget.
-        eval_fn: Callable(board) -> (policy, value) for leaf evaluation.
+        eval_fn: Callable(board) -> (policy, value) when nvl=1, or
+                 Callable(list[board]) -> (policies, values) when nvl>1.
         cpuct: PUCT constant for non-root traversal.
+        num_virtual_leaves: Leaves to find per eval call (1 = original behavior).
 
     Returns:
         The winning move after Sequential Halving.
@@ -362,6 +369,7 @@ def sequential_halving(
     remaining = list(candidate_moves)
     num_phases = max(1, int(np.ceil(np.log2(len(remaining)))))
     sims_per_phase = max(1, num_simulations // num_phases)
+    nvl = num_virtual_leaves
 
     for phase in range(num_phases):
         if len(remaining) <= 1:
@@ -374,40 +382,221 @@ def sequential_halving(
             if child_idx is None:
                 continue
 
-            # Build board with root move applied
             child_board = board.copy(stack=False)
             child_board.push(move)
 
-            for _ in range(sims_per_action):
+            sims_done = 0
+            while sims_done < sims_per_action:
+                # Handle terminal / unexpanded child (no batching needed)
                 if tree.is_terminal[child_idx]:
                     tree.backup(child_idx, terminal_value(child_board))
+                    sims_done += 1
                     continue
 
                 if not tree.is_expanded[child_idx]:
-                    # Expand this child first
-                    policy, value = eval_fn(child_board)
-                    tree.expand(child_idx, child_board, policy)
-                    tree.backup(child_idx, value)
+                    if nvl > 1:
+                        policies, values = eval_fn([child_board])
+                        tree.expand(child_idx, child_board, policies[0])
+                        tree.backup(child_idx, float(values[0]))
+                    else:
+                        policy, value = eval_fn(child_board)
+                        tree.expand(child_idx, child_board, policy)
+                        tree.backup(child_idx, value)
+                    sims_done += 1
                     continue
 
-                # Find leaf in subtree
-                leaf_idx, leaf_board = tree.find_leaf_in_subtree(
-                    child_idx, child_board, cpuct,
-                )
+                # Find up to nvl leaves with virtual loss
+                batch_size = min(nvl, sims_per_action - sims_done)
+                leaves: list[tuple[int, object, np.ndarray]] = []  # (leaf_idx, leaf_board, path)
 
-                if tree.is_terminal[leaf_idx] or leaf_board.is_game_over(claim_draw=False):
-                    tree.backup(leaf_idx, terminal_value(leaf_board))
+                for _ in range(batch_size):
+                    leaf_idx, leaf_board, path = tree.find_leaf_in_subtree_vl(
+                        child_idx, child_board, cpuct,
+                    )
+                    if tree.is_terminal[leaf_idx] or leaf_board.is_game_over(claim_draw=False):
+                        tree.remove_virtual_loss(path)
+                        tree.backup(leaf_idx, terminal_value(leaf_board))
+                        sims_done += 1
+                    else:
+                        leaves.append((leaf_idx, leaf_board, path))
+
+                if not leaves:
+                    continue
+
+                # Batch evaluate all non-terminal leaves
+                if nvl > 1:
+                    leaf_boards = [lb for _, lb, _ in leaves]
+                    policies, values = eval_fn(leaf_boards)
+                    for k, (leaf_idx, lb, path) in enumerate(leaves):
+                        tree.expand(leaf_idx, lb, policies[k])
+                        tree.remove_virtual_loss(path)
+                        tree.backup(leaf_idx, float(values[k]))
                 else:
-                    policy, value = eval_fn(leaf_board)
-                    tree.expand(leaf_idx, leaf_board, policy)
+                    # Single leaf (nvl=1 path)
+                    leaf_idx, lb, path = leaves[0]
+                    policy, value = eval_fn(lb)
+                    tree.expand(leaf_idx, lb, policy)
+                    tree.remove_virtual_loss(path)
                     tree.backup(leaf_idx, value)
 
-        # Eliminate worst half based on Q-values (from root's perspective)
+                sims_done += len(leaves)
+
         q_values = tree.get_child_q_values(negate=True)
         remaining.sort(key=lambda m: q_values.get(m, float('-inf')), reverse=True)
         remaining = remaining[:max(1, len(remaining) // 2)]
 
     return remaining[0]
+
+
+@dataclass
+class _GumbelGameState:
+    """Per-game state tracked during batched Sequential Halving."""
+    game_idx: int
+    tree: MCTSTree
+    board: chess.Board  # Root board
+    remaining_moves: list[chess.Move]
+    child_boards: dict  # move → board with move applied (cached)
+    sims_done: dict  # move → sims completed this phase
+
+
+def sequential_halving_batched(
+    game_states: list[tuple[int, MCTSTree, chess.Board, list[chess.Move]]],
+    num_simulations: int,
+    eval_batch_fn,
+    cpuct: float = 1.25,
+    num_virtual_leaves: int = 8,
+) -> dict[int, chess.Move]:
+    """Batched Sequential Halving across multiple games with virtual leaves.
+
+    Collects leaves from ALL games × ALL remaining actions × virtual leaves,
+    evaluates them in one batched NN call, then expands and backs up.
+
+    Args:
+        game_states: List of (game_idx, tree, board, candidate_moves) tuples.
+        num_simulations: Total simulation budget per game.
+        eval_batch_fn: Callable(list[Board]) -> (policies_batch, values_batch).
+                       Evaluates multiple boards in one GPU batch.
+        cpuct: PUCT constant for non-root traversal.
+        num_virtual_leaves: Max parallel leaves per action per sim round.
+
+    Returns:
+        Dict mapping game_idx → winning move.
+    """
+    if not game_states:
+        return {}
+
+    # Initialize per-game state
+    games: list[_GumbelGameState] = []
+    for game_idx, tree, board, candidates in game_states:
+        child_boards: dict = {}
+        for move in candidates:
+            cb = board.copy(stack=False)
+            cb.push(move)
+            child_boards[move] = cb
+        games.append(_GumbelGameState(
+            game_idx=game_idx,
+            tree=tree,
+            board=board,
+            remaining_moves=list(candidates),
+            child_boards=child_boards,
+            sims_done={m: 0 for m in candidates},
+        ))
+
+    # Compute phase structure (use max K across games for uniformity)
+    max_K = max(len(g.remaining_moves) for g in games) if games else 1
+    num_phases = max(1, int(np.ceil(np.log2(max_K))))
+    sims_per_phase = max(1, num_simulations // num_phases)
+
+    for phase in range(num_phases):
+        # Compute sims_per_action for each game (may differ as K shrinks)
+        for g in games:
+            n_remaining = len(g.remaining_moves)
+            if n_remaining <= 0:
+                continue
+            spa = max(1, sims_per_phase // n_remaining)
+            g.sims_done = {m: 0 for m in g.remaining_moves}
+            g._target_sims = spa  # type: ignore[attr-defined]
+
+        # Run simulation rounds with virtual leaf batching
+        any_work = True
+        while any_work:
+            any_work = False
+
+            # ── Collect leaves across all games × actions × virtual leaves ──
+            # Each leaf: (game_state, move, leaf_idx, leaf_board, path_or_None)
+            leaves_to_eval: list[tuple[_GumbelGameState, chess.Move, int, object, object]] = []
+            terminal_leaves: list[tuple[_GumbelGameState, int, object, object]] = []
+
+            for g in games:
+                target = getattr(g, '_target_sims', 1)
+                for move in g.remaining_moves:
+                    sims_left = target - g.sims_done[move]
+                    if sims_left <= 0:
+                        continue
+                    any_work = True
+
+                    child_idx = g.tree.get_child_for_move(move)
+                    if child_idx is None:
+                        g.sims_done[move] = target
+                        continue
+
+                    child_board = g.child_boards[move]
+                    nvl = min(num_virtual_leaves, sims_left)
+
+                    for _ in range(nvl):
+                        if g.tree.is_terminal[child_idx]:
+                            g.tree.backup(child_idx, terminal_value(child_board))
+                            g.sims_done[move] += 1
+                            continue
+
+                        if not g.tree.is_expanded[child_idx]:
+                            # Need to expand this child — add to eval batch
+                            leaves_to_eval.append((g, move, child_idx, child_board, None))
+                            g.sims_done[move] += 1
+                            break  # Can't find more leaves until expanded
+
+                        # Find leaf in subtree with virtual loss
+                        leaf_idx, leaf_board, path = g.tree.find_leaf_in_subtree_vl(
+                            child_idx, child_board, cpuct,
+                        )
+
+                        if g.tree.is_terminal[leaf_idx] or leaf_board.is_game_over(claim_draw=False):
+                            g.tree.remove_virtual_loss(path)
+                            g.tree.backup(leaf_idx, terminal_value(leaf_board))
+                            g.sims_done[move] += 1
+                        else:
+                            leaves_to_eval.append((g, move, leaf_idx, leaf_board, path))
+                            g.sims_done[move] += 1
+
+            # ── Batch evaluate all collected leaves ──
+            if leaves_to_eval:
+                boards_to_eval = [lb for _, _, _, lb, _ in leaves_to_eval]
+                policies_batch, values_batch = eval_batch_fn(boards_to_eval)
+
+                for j, (g, move, leaf_idx, lb, path) in enumerate(leaves_to_eval):
+                    policy = policies_batch[j]
+                    value = float(values_batch[j])
+                    g.tree.expand(leaf_idx, lb, policy)
+                    if path is not None:
+                        g.tree.remove_virtual_loss(path)
+                    g.tree.backup(leaf_idx, value)
+
+            # Check if all games have completed their sim budget this round
+            if not leaves_to_eval:
+                break
+
+        # ── Halve remaining actions for each game ──
+        for g in games:
+            if len(g.remaining_moves) <= 1:
+                continue
+            q_values = g.tree.get_child_q_values(negate=True)
+            g.remaining_moves.sort(
+                key=lambda m: q_values.get(m, float('-inf')),
+                reverse=True,
+            )
+            g.remaining_moves = g.remaining_moves[:max(1, len(g.remaining_moves) // 2)]
+
+    return {g.game_idx: g.remaining_moves[0] for g in games}
 
 
 def select_gumbel_move(

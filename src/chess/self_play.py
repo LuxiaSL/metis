@@ -23,6 +23,7 @@ import logging
 import multiprocessing as mp
 import os
 import queue
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -38,8 +39,8 @@ from src.chess.bitboard import Board as BitboardBoard
 from src.chess.mcts import (
     MCTSConfig, BatchedMCTS, GumbelConfig,
     terminal_value, select_move,
-    gumbel_top_k, sequential_halving, compute_sigma,
-    compute_improved_policy, select_gumbel_move,
+    gumbel_top_k, sequential_halving,
+    compute_sigma, compute_improved_policy, select_gumbel_move,
 )
 from src.chess.mcts_array import MCTSTree
 
@@ -48,11 +49,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GameRecord:
-    """One completed self-play game."""
+    """One completed self-play game.
+
+    With playout cap randomization (PCR), only "training moves" (full-budget
+    search) are recorded. Fast moves (policy-only, for game progression) are
+    played but not stored — so len(positions) <= total plies played.
+    """
 
     positions: list[torch.Tensor] = field(default_factory=list)
     policies: list[torch.Tensor] = field(default_factory=list)
     activities: list[float] = field(default_factory=list)
+    root_values: list[float] = field(default_factory=list)  # MCTS root value per training move
     outcome: float = 0.0
 
     def __len__(self) -> int:
@@ -78,6 +85,11 @@ class SelfPlayConfig:
     mcts_algorithm: str = "alphazero"  # "alphazero" or "gumbel"
     gumbel_K: int = 16
     gumbel_c_visit: float = 50.0
+
+    # Playout cap randomization (KataGo-style)
+    playout_cap_fraction: float = 1.0  # 1.0 = disabled (all moves full search)
+    # Material adjudication threshold at max_moves
+    material_adjudication_threshold: float = 3.0
 
     def to_mcts_config(self) -> MCTSConfig:
         return MCTSConfig(
@@ -105,6 +117,7 @@ class SelfPlayConfig:
 
 _SHUTDOWN_SENTINEL = -1
 SLOTS_PER_WORKER = 64  # static allocation: worker i owns [i*64 : (i+1)*64]
+                       # Max per-eval: num_virtual_leaves (8) — fits comfortably
 
 # Piece values for material adjudication (standard centipawn / 100)
 _PIECE_VALUES = {
@@ -113,7 +126,7 @@ _PIECE_VALUES = {
 }
 
 
-def _material_adjudicate(board: chess.Board, threshold: float = 3.0) -> float:
+def _material_adjudicate(board: chess.Board, threshold: float = 9.0) -> float:
     """Adjudicate based on material balance when max_moves is reached.
 
     Returns +1 (white wins), -1 (black wins), or 0 (draw) based on whether
@@ -167,6 +180,8 @@ def _worker_fn(
     shared_values: torch.Tensor,
     mcts_algorithm: str = "alphazero",
     gumbel_config: Optional[GumbelConfig] = None,
+    playout_cap_fraction: float = 1.0,
+    material_adjudication_threshold: float = 9.0,
 ) -> None:
     """Worker process: manages MCTS trees for assigned games (CPU only).
 
@@ -183,6 +198,8 @@ def _worker_fn(
             shared_boards, shared_policies, shared_values,
             mcts_algorithm=mcts_algorithm,
             gumbel_config=gumbel_config,
+            playout_cap_fraction=playout_cap_fraction,
+            material_adjudication_threshold=material_adjudication_threshold,
         )
     except Exception as e:
         logger.error("Worker %d crashed: %s", worker_id, e, exc_info=True)
@@ -205,6 +222,8 @@ def _run_worker(
     shared_values: torch.Tensor,
     mcts_algorithm: str = "alphazero",
     gumbel_config: Optional[GumbelConfig] = None,
+    playout_cap_fraction: float = 1.0,
+    material_adjudication_threshold: float = 9.0,
 ) -> None:
     """Core worker loop using shared memory for board/policy/value transfer."""
     # Numpy views of shared tensors (zero-copy, backed by /dev/shm)
@@ -268,14 +287,16 @@ def _run_worker(
     # Initial expansion
     _expand_roots()
 
-    def _eval_single(b: chess.Board) -> tuple[np.ndarray, float]:
-        """Evaluate a single board position via the shared evaluator.
+    def _eval_vl_batch(boards_to_eval: list) -> tuple[np.ndarray, np.ndarray]:
+        """Evaluate a list of boards via the shared evaluator.
 
-        Returns (softmax_policy, value). Used by sequential_halving for
-        leaf expansion during Gumbel search.
+        Returns (softmax_policies, values). Used by sequential_halving
+        with num_virtual_leaves > 1 for batched leaf evaluation.
         """
-        logits_batch, values_batch = _request_eval([b])
-        return _softmax(logits_batch[0:1])[0], float(values_batch[0])
+        if not boards_to_eval:
+            return np.empty((0, POLICY_SIZE), dtype=np.float32), np.empty(0, dtype=np.float32)
+        logits_batch, values_batch = _request_eval(boards_to_eval)
+        return _softmax(logits_batch), values_batch
 
     # Track selected moves per game for tree reuse
     selected_moves: dict[int, Optional[chess.Move]] = {}
@@ -285,7 +306,10 @@ def _run_worker(
         selected_moves.clear()
 
         if use_gumbel:
-            # ── Gumbel AlphaZero search ───────────────────────────
+            # ── Gumbel AlphaZero search (per-game, VL-batched evals) ──
+            # With playout cap randomization (PCR): only a fraction of moves
+            # get full Sequential Halving search. The rest play from the raw
+            # network policy for game progression, without recording training data.
             assert gumbel_config is not None
             for i in active_list:
                 logits_i = root_logits[i]
@@ -299,48 +323,61 @@ def _run_worker(
                     selected_moves[i] = None
                     continue
 
-                # Gumbel-Top-K: sample K candidate moves
-                K = min(gumbel_config.max_K, len(legal_moves))
-                legal_indices = [MoveEncoder.move_to_index(m) for m in legal_moves]
-                selected_indices, gumbel_scores = gumbel_top_k(logits_i, legal_indices, K)
-
-                # Map selected indices back to moves
-                idx_to_move = {MoveEncoder.move_to_index(m): m for m in legal_moves}
-                candidate_moves = [idx_to_move[si] for si in selected_indices]
-
-                # Sequential Halving
-                winner = sequential_halving(
-                    trees[i], boards[i], candidate_moves,
-                    gumbel_config.num_simulations, _eval_single,
-                    gumbel_config.cpuct,
-                )
-
-                # Completed Q-values for ALL legal moves
-                completed_q = trees[i].get_completed_q_values(
-                    root_values[i], legal_moves,
-                )
-
-                # Improved policy target
-                sigma = compute_sigma(completed_q, gumbel_config.c_visit)
-                improved_policy = compute_improved_policy(
-                    logits_i, completed_q, legal_moves, sigma,
-                )
-
-                # Record position with improved policy
-                records[i].positions.append(BoardEncoder.encode_board(boards[i]))
-                records[i].policies.append(torch.from_numpy(improved_policy))
-                records[i].activities.append(_legal_move_count(boards[i]) / 40.0)
-
-                # Select move: use Gumbel scores + Q for exploration early,
-                # deterministic (winner) later
+                is_training_move = (random.random() < playout_cap_fraction)
                 ply = ply_counts[i]
-                if ply < temperature_threshold:
-                    q_values = trees[i].get_child_q_values(negate=True)
-                    move = select_gumbel_move(
-                        candidate_moves, gumbel_scores, q_values, sigma,
+
+                if is_training_move:
+                    # ── Full search: Gumbel SH → record training data ──
+                    K = min(gumbel_config.max_K, len(legal_moves))
+                    legal_indices = [MoveEncoder.move_to_index(m) for m in legal_moves]
+                    selected_indices, gumbel_scores = gumbel_top_k(logits_i, legal_indices, K)
+
+                    idx_to_move = {MoveEncoder.move_to_index(m): m for m in legal_moves}
+                    candidate_moves = [idx_to_move[si] for si in selected_indices]
+
+                    winner = sequential_halving(
+                        trees[i], boards[i], candidate_moves,
+                        gumbel_config.num_simulations, _eval_vl_batch,
+                        gumbel_config.cpuct,
+                        num_virtual_leaves=nvl,
                     )
+
+                    completed_q = trees[i].get_completed_q_values(
+                        root_values[i], legal_moves,
+                    )
+                    sigma = compute_sigma(completed_q, gumbel_config.c_visit)
+                    improved_policy = compute_improved_policy(
+                        logits_i, completed_q, legal_moves, sigma,
+                    )
+
+                    # Record training data (position, improved policy, root value)
+                    records[i].positions.append(BoardEncoder.encode_board(boards[i]))
+                    records[i].policies.append(torch.from_numpy(improved_policy))
+                    records[i].activities.append(_legal_move_count(boards[i]) / 40.0)
+                    records[i].root_values.append(root_values[i])
+
+                    # Select move via Gumbel
+                    if ply < temperature_threshold:
+                        q_values = trees[i].get_child_q_values(negate=True)
+                        move = select_gumbel_move(
+                            candidate_moves, gumbel_scores, q_values, sigma,
+                        )
+                    else:
+                        move = winner
                 else:
-                    move = winner
+                    # ── Fast move: play from raw policy, no search, no recording ──
+                    legal_indices = np.array(
+                        [MoveEncoder.move_to_index(m) for m in legal_moves],
+                        dtype=np.intp,
+                    )
+                    legal_logits = logits_i[legal_indices]
+
+                    if ply < temperature_threshold:
+                        probs = _softmax(legal_logits[np.newaxis])[0]
+                        move_idx = np.random.choice(len(legal_moves), p=probs)
+                    else:
+                        move_idx = int(np.argmax(legal_logits))
+                    move = legal_moves[move_idx]
 
                 boards[i].push(move)
                 ply_counts[i] += 1
@@ -405,7 +442,9 @@ def _run_worker(
                 records[i].outcome = _get_outcome(boards[i])
                 finished_this_round.append(i)
             elif ply_counts[i] >= max_moves:
-                records[i].outcome = _material_adjudicate(boards[i])
+                records[i].outcome = _material_adjudicate(
+                    boards[i], threshold=material_adjudication_threshold,
+                )
                 finished_this_round.append(i)
             else:
                 # Tree reuse (AlphaZero) or fresh tree (Gumbel)
@@ -449,6 +488,7 @@ def _run_worker(
             "positions": [p.numpy() for p in record.positions],
             "policies": [p.numpy() for p in record.policies],
             "activities": record.activities,
+            "root_values": record.root_values,
             "outcome": record.outcome,
         }
         game_result_queue.put(("game", worker_id, serialized))
@@ -834,6 +874,8 @@ class ParallelSelfPlay:
                     eval_request_queue, result_queues[i], game_result_queue,
                     shared_boards, shared_policies, shared_values,
                     self.config.mcts_algorithm, gumbel_cfg,
+                    self.config.playout_cap_fraction,
+                    self.config.material_adjudication_threshold,
                 ),
                 daemon=True,
             )
@@ -867,6 +909,7 @@ class ParallelSelfPlay:
                     positions=[torch.from_numpy(p) for p in payload["positions"]],
                     policies=[torch.from_numpy(p) for p in payload["policies"]],
                     activities=payload.get("activities", []),
+                    root_values=payload.get("root_values", []),
                     outcome=payload["outcome"],
                 )
                 completed_games.append(record)
@@ -965,6 +1008,7 @@ class SelfPlayWorker:
                 record.positions.append(BoardEncoder.encode_board(board))
                 record.policies.append(MoveEncoder.encode_policy(vc))
                 record.activities.append(_legal_move_count(board) / 40.0)
+                record.root_values.append(0.0)  # Single-process path: no root value available
 
                 ply = ply_counts[game_idx]
                 temp = self.config.temperature if ply < self.config.temperature_threshold else 0.0
@@ -976,7 +1020,9 @@ class SelfPlayWorker:
                 if board.is_game_over(claim_draw=True):
                     record.outcome = _get_outcome(board)
                 elif ply_counts[game_idx] >= self.config.max_moves:
-                    record.outcome = _material_adjudicate(board)
+                    record.outcome = _material_adjudicate(
+                        board, threshold=self.config.material_adjudication_threshold,
+                    )
                 else:
                     next_active.append(game_idx)
 

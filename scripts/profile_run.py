@@ -726,6 +726,9 @@ def main() -> None:
         temperature_threshold=sp_cfg.get("temperature_threshold", 30),
         dirichlet_epsilon=sp_cfg.get("dirichlet_epsilon", 0.25),
         num_virtual_leaves=sp_cfg.get("num_virtual_leaves", 8),
+        mcts_algorithm=sp_cfg.get("mcts_algorithm", "alphazero"),
+        gumbel_K=sp_cfg.get("gumbel_K", 16),
+        gumbel_c_visit=sp_cfg.get("gumbel_c_visit", 50.0),
     )
 
     games_per_iter = sp_cfg.get("games_per_iter", 32)

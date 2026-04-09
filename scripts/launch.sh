@@ -48,11 +48,22 @@ nvl = get('self_play.num_virtual_leaves', 8)
 temp_thresh = get('self_play.temperature_threshold', 200)
 dir_eps = get('self_play.dirichlet_epsilon', 0.4)
 
+# MCTS algorithm
+mcts_algo = get('self_play.mcts_algorithm', 'alphazero')
+gumbel_k = get('self_play.gumbel_K', 16)
+gumbel_c = get('self_play.gumbel_c_visit', 50.0)
+
 # Training
 batch = get('training.batch_size', 32)
 steps = get('training.train_steps_per_iter', 1000)
 iters = get('training.num_iterations', 200)
 buffer = get('training.buffer_size', 1000000)
+decisive = get('training.decisive_boost', 1.0)
+q_blend = get('training.q_blend', 0.0)
+
+# Self-play (continued)
+pcr_frac = get('self_play.playout_cap_fraction', 1.0)
+mat_adj_thresh = get('self_play.material_adjudication_threshold', 9.0)
 
 # Eval
 eval_every = get('eval.eval_every', 5)
@@ -100,6 +111,17 @@ args.append(f'--buffer_size {buffer}')
 args.append(f'--temperature_threshold {temp_thresh}')
 args.append(f'--dirichlet_epsilon {dir_eps}')
 args.append(f'--num_virtual_leaves {nvl}')
+args.append(f'--mcts_algorithm {mcts_algo}')
+if mcts_algo == 'gumbel':
+    args.append(f'--gumbel_K {gumbel_k}')
+    args.append(f'--gumbel_c_visit {gumbel_c}')
+if float(decisive) > 1.0:
+    args.append(f'--decisive_boost {decisive}')
+if float(q_blend) > 0.0:
+    args.append(f'--q_blend {q_blend}')
+if float(pcr_frac) < 1.0:
+    args.append(f'--playout_cap_fraction {pcr_frac}')
+args.append(f'--material_adjudication_threshold {mat_adj_thresh}')
 args.append(f'--eval_every {eval_every}')
 args.append(f'--eval_games_per_depth {eval_gpd}')
 args.append(f'--eval_mcts_sims {eval_sims}')

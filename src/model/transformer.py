@@ -189,18 +189,20 @@ class RelativePositionBias(nn.Module):
         super().__init__()
         seq_len = config.seq_len  # 67
         n_global = config.num_global_tokens  # 3
+        num_heads = config.num_attention_heads  # per-head biases for specialization
+        self.num_heads = num_heads
 
-        # Embeddings for distance features (shared across all square pairs)
-        self.rank_diff_embed = nn.Embedding(8, 1)  # |rank_i - rank_j| ∈ [0, 7]
-        self.file_diff_embed = nn.Embedding(8, 1)  # |file_i - file_j| ∈ [0, 7]
+        # Per-head embeddings for distance features
+        self.rank_diff_embed = nn.Embedding(8, num_heads)  # |rank_i - rank_j| ∈ [0, 7]
+        self.file_diff_embed = nn.Embedding(8, num_heads)  # |file_i - file_j| ∈ [0, 7]
 
-        # Learned scalars for boolean features
-        self.diag_bias = nn.Parameter(torch.zeros(1))
-        self.antidiag_bias = nn.Parameter(torch.zeros(1))
-        self.knight_bias = nn.Parameter(torch.zeros(1))
+        # Per-head learned biases for boolean features
+        self.diag_bias = nn.Parameter(torch.zeros(num_heads))
+        self.antidiag_bias = nn.Parameter(torch.zeros(num_heads))
+        self.knight_bias = nn.Parameter(torch.zeros(num_heads))
 
-        # Global token biases: each global token has learned bias to/from all positions
-        self.global_bias = nn.Parameter(torch.zeros(n_global, seq_len))
+        # Per-head global token biases
+        self.global_bias = nn.Parameter(torch.zeros(num_heads, n_global, seq_len))
 
         # Precompute topology feature indices for the 64x64 square block
         rank_diff = torch.zeros(64, 64, dtype=torch.long)
@@ -229,30 +231,32 @@ class RelativePositionBias(nn.Module):
         self._n_global = n_global
 
     def forward(self) -> torch.Tensor:
-        """Compute the (1, 1, 67, 67) relative position bias matrix."""
+        """Compute the (1, H, 67, 67) per-head relative position bias matrix."""
+        H = self.num_heads
         bias = torch.zeros(
-            self._seq_len, self._seq_len,
+            H, self._seq_len, self._seq_len,
             device=self._rank_diff.device, dtype=self.rank_diff_embed.weight.dtype,
         )
 
         # Square-to-square biases (positions 3-66)
+        # Embedding lookups: (64, 64) indices → (64, 64, H)
+        # Boolean features: (64, 64, 1) * (H,) → (64, 64, H) via broadcast
         g = self._n_global
         sq_bias = (
-            self.rank_diff_embed(self._rank_diff).squeeze(-1)
-            + self.file_diff_embed(self._file_diff).squeeze(-1)
-            + self._same_diag * self.diag_bias
-            + self._same_antidiag * self.antidiag_bias
-            + self._knight_reach * self.knight_bias
-        )
-        bias[g:, g:] = sq_bias
+            self.rank_diff_embed(self._rank_diff)
+            + self.file_diff_embed(self._file_diff)
+            + self._same_diag.unsqueeze(-1) * self.diag_bias
+            + self._same_antidiag.unsqueeze(-1) * self.antidiag_bias
+            + self._knight_reach.unsqueeze(-1) * self.knight_bias
+        )  # (64, 64, H)
+        bias[:, g:, g:] = sq_bias.permute(2, 0, 1)  # (H, 64, 64)
 
-        # Global token biases: global→all (rows) and square→global (columns)
-        # Row assignment covers global→global and global→square
-        # Column assignment adds square→global only (avoids double-counting g×g block)
-        bias[:g, :] = self.global_bias              # (3, 67): global tokens attend to everything
-        bias[g:, :g] = self.global_bias[:, g:].T    # (64, 3): squares attend to global tokens
+        # Global token biases: per-head (H, n_global, seq_len)
+        # Row: global→all positions; Column: square→global (avoids double-counting g×g)
+        bias[:, :g, :] = self.global_bias                            # (H, 3, 67)
+        bias[:, g:, :g] = self.global_bias[:, :, g:].transpose(1, 2)  # (H, 64, 3)
 
-        return bias.unsqueeze(0).unsqueeze(0)  # (1, 1, 67, 67)
+        return bias.unsqueeze(0)  # (1, H, 67, 67)
 
 
 class GQAttention(nn.Module):
