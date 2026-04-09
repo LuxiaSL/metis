@@ -967,6 +967,11 @@ def train(args: argparse.Namespace) -> None:
                 sample_weights = torch.ones_like(surprises)
             sample_weights = sample_weights.to(device)
 
+            # Adaptive q_blend: trust q-targets proportional to value head signal
+            # When mean|Q|≈0 (flat value head), use pure z-targets.
+            # As value head develops (mean|Q|→0.15+), ramp up to configured max.
+            effective_q_blend = min(args.q_blend, 5.0 * mean_abs_q)
+
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 policy_logits, wdl_logits, material_pred, activity_pred, moves_left_pred = model(boards)
                 losses = compute_loss(
@@ -974,7 +979,7 @@ def train(args: argparse.Namespace) -> None:
                     target_policies, target_values, target_q_wdl,
                     target_materials, target_activities, target_moves_left,
                     z_loss_weight=config.z_loss_weight,
-                    q_blend=args.q_blend,
+                    q_blend=effective_q_blend,
                     sample_weights=sample_weights,
                 )
 
@@ -1058,6 +1063,7 @@ def train(args: argparse.Namespace) -> None:
                     "selfplay/positions_per_sec": total_positions / max(selfplay_time, 1e-6),
                     "selfplay/evals_per_sec": iter_evals / max(selfplay_time, 1e-6),
                     "selfplay/mean_abs_q": mean_abs_q,
+                    "train/effective_q_blend": effective_q_blend,
                     # Cumulative totals
                     "cumulative/games": cumul_games,
                     "cumulative/positions": cumul_positions,
